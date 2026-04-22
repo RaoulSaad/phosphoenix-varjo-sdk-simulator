@@ -1,0 +1,15 @@
+var searchData=
+[
+  ['targetcolor_134',['targetColor',['../_varjo__types__mr_8h.html#a41d59536f770de1147a879acb7a5c7b4',1,'varjo_ChromaKeyParams_HSV']]],
+  ['texturearraysize_135',['textureArraySize',['../_varjo__types__layers_8h.html#a36b6092d62f21a10e616d579fc1639a9',1,'varjo_SwapChainConfig2']]],
+  ['textureformat_136',['textureFormat',['../_varjo__types__layers_8h.html#a9829c5b33832aa21b19c8d3f2d06915d',1,'varjo_SwapChainConfig2']]],
+  ['textureheight_137',['textureHeight',['../_varjo__types__layers_8h.html#a102fd8a12cf7edb056d6ff7d7b78bab8',1,'varjo_SwapChainConfig2']]],
+  ['texturesizechange_138',['textureSizeChange',['../_varjo__events_8h.html#a6af42d2c4294f8ba10590a34e5448713',1,'varjo_EventData']]],
+  ['texturewidth_139',['textureWidth',['../_varjo__types__layers_8h.html#a348524680f3114709c2af714f229869f',1,'varjo_SwapChainConfig2']]],
+  ['timestamp_140',['timestamp',['../_varjo__events_8h.html#a423366e6579afef0406ef4467080baaa',1,'varjo_EventHeader::timestamp()'],['../_varjo__types__datastream_8h.html#af2ae1dc6167b81c627cc502fb7a1514a',1,'varjo_DistortedColorFrameMetadata::timestamp()'],['../_varjo__types__datastream_8h.html#a8d2e7cf74504f4163493bbaeff3ab167',1,'varjo_EnvironmentCubemapFrameMetadata::timestamp()'],['../_varjo__types__datastream_8h.html#a880ff8d2fbcf2ca70e7708d3efa68659',1,'varjo_EyeCameraFrameMetadata::timestamp()'],['../_varjo__types__world_8h.html#a87eeb3011e21366393ac6cb3eef04898',1,'varjo_WorldPoseComponent::timeStamp()']]],
+  ['tolerance_141',['tolerance',['../_varjo__types__mr_8h.html#ad56fd9aa4a8cd0dbba9c9ea7484ed2a5',1,'varjo_ChromaKeyParams_HSV']]],
+  ['top_142',['top',['../_varjo__types_8h.html#a2669cf1a4e57b83c57cfc4d508456312',1,'varjo_FovTangents']]],
+  ['trackingstatus_143',['trackingStatus',['../_varjo__events_8h.html#ab71e6a453d5ee77e2cfb884b3328e387',1,'varjo_EventData']]],
+  ['type_144',['type',['../_varjo__events_8h.html#a73ee90706edd1ce1da9b322c053697c1',1,'varjo_EventHeader::type()'],['../_varjo__events_8h.html#ab8845cc184f378f3f98f6b15cf4a6be5',1,'varjo_EventMRCameraPropertyChange::type()'],['../_varjo__types_8h.html#af95c245c969c4df9bf5376488176233e',1,'varjo_StructureExtension::type()'],['../_varjo__types__datastream_8h.html#a6e77280f57c327299c293c3d30d2c992',1,'varjo_BufferMetadata::type()'],['../_varjo__types__datastream_8h.html#a3164df71ff9942ae7b59ca4166f3ca88',1,'varjo_StreamFrame::type()'],['../_varjo__types__layers_8h.html#ae45935e24868b14e0602843beb9c0d1f',1,'varjo_LayerHeader::type()'],['../_varjo__types__layers_8h.html#a02710974765bb73d448013d0a4733960',1,'varjo_ViewExtension::type()'],['../_varjo__types__mr_8h.html#a0c5bcd94878c0123ef9956b483db2e75',1,'varjo_ChromaKeyConfig::type()'],['../_varjo__types__mr_8h.html#a4780cce5dee68e0b745448df2b66fe90',1,'varjo_CameraPropertyValue::type()']]],
+  ['typemask_145',['typeMask',['../_varjo__events_8h.html#ab5275e4518d62d6097352568738329da',1,'varjo_EventTextureSizeChange::typeMask()'],['../_varjo__types__world_8h.html#a83e972c9e7b97381580753075e0c21d9',1,'varjo_WorldObject::typeMask()']]]
+];

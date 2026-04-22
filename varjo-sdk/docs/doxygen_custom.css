@@ -1,0 +1,245 @@
+body, table, div, p, dl {
+	font: 400 16px/22px 'Roboto', 'Helvetica Neue', 'Calibri Light', sans-serif;
+	/*background-color: #ffffff;*/
+	color: #232323;
+	text-rendering: optimizeLegibility;
+	-webkit-font-smoothing: antialiased;
+}
+
+p.reference, p.definition {
+	font: 400 16px/22px 'Roboto', 'Helvetica Neue', 'Calibri Light', sans-serif;
+	/*background-color: #ffffff;*/
+	color: #232323;
+}
+
+title {
+	font: 400 16px/28px 'Roboto', 'Helvetica Neue', 'Calibri Light', sans-serif;
+	background-color: #ffffff;
+	color: #232323;
+}
+
+.title {
+	font: 400 16px/28px 'Roboto', 'Helvetica Neue', 'Calibri Light', sans-serif;
+	background-color: #ffffff;
+	color: #232323;
+}
+
+table.directory {
+    font: 400 16px 'Roboto', 'Helvetica Neue', 'Calibri Light', sans-serif;
+	background-color: #0F0F0F;
+	color: #232323;
+}
+
+#projectname
+{
+	font: 200% 'Roboto', 'Helvetica Neue', 'Calibri Light', sans-serif;
+	margin: 0px;
+	padding: 2px 0px;
+	background-color: #ffffff;
+	color: #232323;
+}
+/*
+#projectlogo 
+{
+	background-color: #232323;
+	max-width: 326px;
+	height: auto;
+	transform: translate(-18px, 0px);
+}
+#projectlogo img {
+	filter: invert(100%);
+}*/
+
+#projectbrief
+{
+	font: 120% 'Roboto', 'Helvetica Neue', 'Calibri Light', sans-serif;
+	margin: 0px;
+	padding: 0px;
+	background-color: #ffffff;
+	color: #232323;
+}
+
+#projectnumber
+{
+	font: 50% 'Roboto', 'Helvetica Neue', 'Calibri Light', sans-serif;
+	margin: 0px;
+	padding: 0px;
+	background-color: #ffffff;
+	color: #232323;
+}
+
+div.toc li {
+	font: 400 16px/28px 'Roboto', 'Helvetica Neue', 'Calibri Light', sans-serif;
+	/*background-color: #ffffff;*/
+	color: #232323;
+}
+
+div.toc h3 {
+	font: bold 400 16px/28px 'Roboto', 'Helvetica Neue', 'Calibri Light', sans-serif;
+	/*background-color: #ffffff;*/
+	color: #232323;
+}
+
+#powerTip div {
+	margin: 0px;
+	padding: 0px;
+	font: 400 16px/28px 'Roboto', 'Helvetica Neue', 'Calibri Light', sans-serif;
+	background-color: #ffffff;
+	color: #232323;
+}
+
+/* navtree.css */
+
+#side-nav {
+	width: 317px;
+}
+
+#nav-tree .label {
+	margin:0px;
+	padding:0px;
+	font: 400 16px/28px 'Roboto', 'Helvetica Neue', 'Calibri Light', sans-serif;
+	color: #232323;
+	background-image: none;
+	background-color: #0F0F0F;
+}
+
+#nav-tree {
+	background-image: none;
+	background-color: #0F0F0F;
+}
+
+#nav-sync {
+	visibility: hidden;
+}
+
+#nav-tree a {
+	color: #CECECE;
+}
+
+#nav-tree .div {
+	background-color: #0F0F0F;
+}
+
+#nav-tree .item {
+	background-color: #0F0F0F;
+}
+
+#nav-tree .selected {
+	background-image: none;
+	background-color: #0F0F0F;
+}
+
+table {
+	/*background-color: #ffffff;*/
+	color: #232323;
+}
+
+/*div {
+	background-color: #ffffff;
+}*/
+
+.memproto {
+	text-shadow: 1px 1px #ffffff;
+}
+
+.paramname {
+	color: #d36868;
+}
+
+h2.groupheader {
+	color: #2a2a2a;
+	border-bottom: none;/*2px solid #333*/
+}
+
+a {
+	color: rgb(133, 161, 216);
+}
+
+.mdescLeft, .mdescRight, .memItemLeft, .memItemRight, .memTemplItemLeft, .memTemplItemRight, .memTemplParams {
+	background-color: #efefef;
+	color: #232323;
+}
+
+.memtitle, .memitem, .memproto, .memdoc {
+	background-color: #efefef;
+	background-image: none;
+	border: 0;
+}
+
+.sm-dox {
+	background-image: none;
+	border: 0;
+}
+
+.memSeparator {
+	border-bottom: none
+}
+
+.directory tr {
+	background-color: #ffffff
+}
+.directory tr.even {
+	background-color: #ffffff
+}
+
+div.directory {
+	border-top: none;
+	border-bottom: none;
+}
+
+.ui-resizable-e {
+	background-image: none;
+	background-color: #ffffff;
+}
+
+div.header {
+	border-bottom: 1px solid #333
+}
+
+.sm-dox a, .sm-dox a:focus, .sm-dox a:active, .sm-dox a:hover, .sm-dox a.highlighted .sm-dox a.current .sm-dox a.disabled .sm-dox a span.sub-arrow {
+	font: 400 16px/28px 'Roboto', 'Helvetica Neue', 'Calibri Light', sans-serif;
+	text-shadow: none;
+	background-image: none;
+	/*text-transform: uppercase;*/
+	color: #2a2a2a;
+	font-weight: bold;
+}
+
+#titlearea {
+	border-bottom: 0px;
+}
+
+span.lineno, span.lineno a {
+	background-color: #ffffff
+}
+
+div.fragment {
+	border: 0px
+}
+
+blockquote {
+	background-color: #ffffff
+}
+
+table.fieldtable {
+	border: none;
+}
+
+.fieldtable th, .fieldtable tr, .fieldtable td.fieldtype, .fieldtable td.fieldname, .fieldtable td.fielddoc {
+	background-image: none;
+	background-color: #ffffff;
+	color: #232323;
+	border: none;
+	border-right: none;
+	border-top: none;
+	border-bottom: none;
+	border-left: none;
+}
+
+a {
+	color: #00B399;
+}
+
+.contents a:visited {
+	color: #00B399;
+}
