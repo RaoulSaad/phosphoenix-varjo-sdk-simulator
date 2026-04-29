@@ -1,6 +1,22 @@
 ////////////////////////////////////////////////////////////////////////////////
 // main.cpp — Varjo XR-4 Mixed Reality: camera pass-through + gaze dot overlay
 // + left camera capture in parallel using Varjo DataStream API.
+//
+// Runtime architecture:
+//   1. Create a tiny Win32/WGL OpenGL context so Varjo GL swapchains can be used.
+//   2. Start a Varjo session, enable MR video pass-through, and initialize gaze.
+//   3. Subscribe to Varjo's distorted-color camera DataStream for both eyes.
+//   4. Send captured NV12 camera frames and current gaze coordinates to Python.
+//   5. Receive Python-generated grayscale phosphene masks back over UDP.
+//   6. Render a transparent overlay layer containing:
+//        - a gaze-centered black scotoma mask, and
+//        - a gaze-centered phosphene texture from Python.
+//
+// Coordinate convention used by the overlay:
+//   The shaders work in "tangent space" rather than pixels. A point on the view
+//   is represented by tan(x angle) and tan(y angle). This makes the overlay line
+//   up with Varjo's per-view FOV tangents even when the headset has multiple
+//   focus/context views.
 ////////////////////////////////////////////////////////////////////////////////
 
 #define WIN32_LEAN_AND_MEAN
@@ -43,6 +59,9 @@
 // GL function pointers
 // ---------------------------------------------------------------------------
 
+// Windows only exposes a very small OpenGL ABI directly from opengl32.dll.
+// Everything modern that this file uses (FBOs, shaders, VAOs, etc.) is loaded
+// at runtime through WGL extension pointers.
 static PFNGLGENFRAMEBUFFERSPROC             glGenFramebuffers = nullptr;
 static PFNGLBINDFRAMEBUFFERPROC             glBindFramebuffer = nullptr;
 static PFNGLFRAMEBUFFERTEXTURE2DPROC        glFramebufferTexture2D = nullptr;
@@ -72,6 +91,8 @@ static PFNGLBLENDFUNCSEPARATEPROC           glBlendFuncSeparate = nullptr;
 
 static void* getGLProcAddressAny(const char* name)
 {
+    // wglGetProcAddress is the normal path for extension functions. Some core
+    // functions may instead be exported by opengl32.dll, so keep a fallback.
     void* p = (void*)wglGetProcAddress(name);
     if (p == nullptr || p == (void*)0x1 || p == (void*)0x2 || p == (void*)0x3 || p == (void*)-1) {
         static HMODULE module = LoadLibraryA("opengl32.dll");
@@ -82,6 +103,8 @@ static void* getGLProcAddressAny(const char* name)
 
 static void loadGLFunctions()
 {
+    // Fail fast here: if any required GL symbol is absent, later rendering
+    // errors would be much harder to diagnose.
     #define LOAD(name) name = (decltype(name))getGLProcAddressAny(#name); \
         if (!name) { fprintf(stderr, "Failed to load " #name "\n"); exit(1); }
     LOAD(glGenFramebuffers);
@@ -126,6 +149,9 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 
 static bool createGLContext()
 {
+    // Varjo's OpenGL API needs a current GL context before swapchains and GL
+    // textures can be created. The program renders to headset swapchain images,
+    // not to this 1x1 helper window.
     WNDCLASSA wc{};
     wc.lpfnWndProc  = wndProc;
     wc.hInstance     = GetModuleHandle(nullptr);
@@ -148,19 +174,22 @@ static bool createGLContext()
 
 static void destroyGLContext()
 {
+    // Release WGL resources in reverse order from creation.
     wglMakeCurrent(nullptr, nullptr);
     if (g_hglrc) wglDeleteContext(g_hglrc);
     if (g_hwnd) DestroyWindow(g_hwnd);
 }
 
 // ---------------------------------------------------------------------------
-// Shader: transparent background + blue gaze dot
+// Shader: transparent background + black scotoma spot
 // ---------------------------------------------------------------------------
 
 static const char* g_vertSrc = R"(
 #version 330 core
 out vec2 vUV;
 void main() {
+    // Fullscreen triangle without a vertex buffer. gl_VertexID produces the
+    // three clip-space corners needed to cover the viewport.
     vUV = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
     gl_Position = vec4(vUV * 2.0 - 1.0, 0.0, 1.0);
     vUV.y = 1.0 - vUV.y;
@@ -188,9 +217,13 @@ void main() {
     float pxTanX = mix(viewLeft,   viewRight,  vUV.x);
     float pxTanY = mix(viewTop,    viewBottom, vUV.y);
 
+    // Distance from the gaze point in angular tangent coordinates. Keeping the
+    // radius in tangent space makes the spot stable across differently sized
+    // Varjo views in the atlas.
     vec2 diff = vec2(pxTanX - gazeTanX, pxTanY - gazeTanY);
     float d = length(diff);
 
+    // Fully opaque at the center, fading to transparent over softEdgeTan.
     float alpha = 1.0 - smoothstep(spotRadiusTan - softEdgeTan,
                                    spotRadiusTan,
                                    d);
@@ -215,6 +248,8 @@ uniform float phospheneOpacity;
 uniform sampler2D phospheneTex;
 
 void main() {
+    // Convert the current pixel to the same tangent coordinate system used for
+    // gaze, then sample the returned phosphene image around the gaze center.
     float pxTanX = mix(viewLeft,  viewRight,  vUV.x);
     float pxTanY = mix(viewTop,   viewBottom, vUV.y);
 
@@ -222,13 +257,17 @@ void main() {
     float radius = phospheneRadiusTan;
 
     if (abs(diff.x) > radius || abs(diff.y) > radius) {
+        // Outside the square bounding box of the circular overlay: emit fully
+        // transparent pixels so the MR camera pass-through remains visible.
         fragColor = vec4(0.0);
         return;
     }
 
+    // Map tangent-space offset [-radius, +radius] to texture UV [0, 1].
     vec2 uv = diff / (2.0 * radius) + vec2(0.5, 0.5);
     float p = texture(phospheneTex, uv).r * phospheneOpacity;
 
+    // The texture is rectangular, so apply a circular mask in tangent space.
     float circleMask = 1.0 - smoothstep(radius - 0.01, radius, length(diff));
     float a = clamp(p * circleMask, 0.0, 1.0);
     fragColor = vec4(a, a, a, a);
@@ -237,6 +276,8 @@ void main() {
 
 struct CropRect
 {
+    // Pixel-space rectangle inside a Varjo viewport, plus the unclamped gaze
+    // center. This is useful when extracting only the scotoma/phosphene region.
     int x0, y0, x1, y1;
     int width, height;
     float cx, cy;
@@ -250,6 +291,9 @@ static CropRect computeScotomaCropUV(
     float softEdge,
     bool solidCoreOnly = false)
 {
+    // The solid core is the area inside the soft fade. Python uses the core
+    // size for phosphene generation, while the renderer can still draw the
+    // larger black spot with a feathered edge.
     const float r = solidCoreOnly
         ? (std::max)(0.0f, spotRadius - softEdge)
         : spotRadius;
@@ -291,6 +335,8 @@ static CropRect computeScotomaCropUV(
 
 static GLuint compileShader(GLenum type, const char* src)
 {
+    // Small helper for the two embedded GLSL programs. Any compile error is
+    // fatal because rendering cannot continue without these overlay shaders.
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, nullptr);
     glCompileShader(s);
@@ -304,6 +350,8 @@ static GLuint compileShader(GLenum type, const char* src)
 
 static GLuint createProgram(const char* fragSrc)
 {
+    // Both overlay passes use the same fullscreen-triangle vertex shader and
+    // differ only in the fragment shader.
     GLuint vs = compileShader(GL_VERTEX_SHADER, g_vertSrc);
     GLuint fs = compileShader(GL_FRAGMENT_SHADER, fragSrc);
     GLuint p = glCreateProgram();
@@ -325,6 +373,9 @@ static GLuint createProgram(const char* fragSrc)
 static std::vector<varjo_Viewport> calculateViewports(
     varjo_Session* session, varjo_TextureSize_Type type)
 {
+    // Varjo swapchains are rendered as an atlas: multiple eye/focus/context
+    // views are packed into one large texture. This function asks Varjo for each
+    // view's recommended texture size, then lays them out two per row.
     const int32_t viewCount = 4;
     std::vector<varjo_Viewport> viewports;
     viewports.reserve(viewCount);
@@ -344,11 +395,13 @@ static std::vector<varjo_Viewport> calculateViewports(
 }
 
 static int32_t getTotalWidth(const std::vector<varjo_Viewport>& vp) {
+    // Atlas width is the largest right edge among all packed viewports.
     int32_t m = 0;
     for (auto& v : vp) m = (std::max)(m, (int32_t)(v.x + v.width));
     return m;
 }
 static int32_t getTotalHeight(const std::vector<varjo_Viewport>& vp) {
+    // Atlas height is the largest bottom edge among all packed viewports.
     int32_t m = 0;
     for (auto& v : vp) m = (std::max)(m, (int32_t)(v.y + v.height));
     return m;
@@ -362,16 +415,23 @@ static int32_t getTotalHeight(const std::vector<varjo_Viewport>& vp) {
 constexpr uint8_t FRAME_START   = 0xFF;
 constexpr uint8_t SHUTDOWN_BYTE = 0xFE;
 constexpr uint8_t CONFIG_OPCODE = 0xFD;
-constexpr uint8_t CONFIG_ACK_OPCODE = 0xFC;   // NEW
+constexpr uint8_t CONFIG_ACK_OPCODE = 0xFC;
+// Keep UDP datagrams comfortably below typical fragmentation limits while still
+// sending large NV12 frames in a small number of chunks.
 constexpr int UDP_CHUNK_SIZE    = 8000;
 constexpr int PYTHON_RECV_PORT  = 5000;
 constexpr int CPP_RECV_PORT     = 5001;
+// Fallback camera angular half-extents used only when Varjo intrinsics are not
+// available. These approximate how a tangent-space radius maps to camera pixels.
 constexpr float kCameraTanHalfX = 0.6f;
 constexpr float kCameraTanHalfY = 0.6f;
-constexpr double kPythonSendIntervalMs = 66.0; // ~15 FPS
+constexpr double kPythonSendIntervalMs = 66.0; // ~15 FPS --> switch to 16.6 for 60 FPS if needed
 
 #pragma pack(push, 1)
 struct PythonConfigPacket {
+    // Sent from C++ to Python before frame chunks. It tells Python how large the
+    // incoming camera frames are and how large a gaze-centered crop it should
+    // produce when returning the phosphene mask.
     uint8_t opcode;
     uint8_t eye;              // 0 = left, 1 = right
     int32_t cropWidth;
@@ -389,11 +449,14 @@ struct PythonConfigPacket {
 };
 
 struct PythonConfigAckPacket {
+    // Sent from Python to C++ once Python has applied the latest per-eye config.
     uint8_t opcode;
     uint8_t eye;   // 0 = left, 1 = right
 };
 
 struct PythonFrameChunkHeader {
+    // Prefix for each C++ -> Python camera frame chunk. The payload immediately
+    // after this header is a slice of the raw NV12 frame buffer.
     uint8_t opcode;
     uint8_t eye;              // 0 = left, 1 = right
     uint32_t frameId;
@@ -404,6 +467,8 @@ struct PythonFrameChunkHeader {
 };
 
 struct CppFrameChunkHeader {
+    // Prefix for each Python -> C++ phosphene mask chunk. The payload after this
+    // header is an 8-bit grayscale crop tile.
     uint8_t opcode;
     uint8_t eye;              // 0 = left, 1 = right
     uint32_t frameId;
@@ -413,6 +478,8 @@ struct CppFrameChunkHeader {
 #pragma pack(pop)
 
 struct PhospheneFrame {
+    // Latest complete grayscale mask received from Python for one eye. "dirty"
+    // tells the render thread that the GL texture needs an upload.
     uint32_t frameId = 0;
     int width = 0;
     int height = 0;
@@ -421,12 +488,16 @@ struct PhospheneFrame {
 };
 
 struct RxAssembly {
+    // Temporary storage for a chunked UDP frame while not all chunks have
+    // arrived yet. Chunks can arrive out of order, so store by chunk index.
     uint32_t total = 0;
     size_t received = 0;
     std::vector<std::vector<uint8_t>> chunks;
 };
 
 struct CapturedEyeFrame {
+    // CPU copy of one Varjo camera frame. The DataStream callback copies into
+    // this object because Varjo owns and recycles the original buffer.
     int eye = 0;              // 0 = left, 1 = right
     int width = 0;
     int height = 0;
@@ -444,6 +515,10 @@ struct CapturedEyeFrame {
 };
 
 struct PhospheneBridge {
+    // Owns the UDP transport and shared state between:
+    //   - camera saver/sender threads,
+    //   - the UDP receive thread,
+    //   - the render loop that uploads GL textures.
     std::atomic<bool> running{false};
     SOCKET sendSock = INVALID_SOCKET;
     SOCKET recvSock = INVALID_SOCKET;
@@ -455,6 +530,8 @@ struct PhospheneBridge {
     std::unordered_map<uint32_t, RxAssembly> assemblies[2];
     PhospheneFrame latest[2];
 
+    // Gaze values are atomics because the render loop writes them while the
+    // camera sender threads read them to annotate outgoing frame chunks.
     std::atomic<float> gazeTanX[2];   // [0]=L, [1]=R
     std::atomic<float> gazeTanY[2];
 
@@ -493,6 +570,8 @@ static void computePythonCropSize(
     int& outCropHeight)
 {
     if (frame && frame->hasIntrinsics && frame->focalLengthX > 0.0 && frame->focalLengthY > 0.0) {
+        // Preferred path: project tangent radius through the camera intrinsics.
+        // A tangent of x corresponds to approximately fx * x pixels from center.
         // Handle both pixel-scale and normalized intrinsics
         double fx = frame->focalLengthX;
         double fy = frame->focalLengthY;
@@ -501,6 +580,8 @@ static void computePythonCropSize(
         outCropWidth  = (std::max)(32, (int)std::lround(2.0 * fx * cropRadiusTan));
         outCropHeight = (std::max)(32, (int)std::lround(2.0 * fy * cropRadiusTan));
     } else {
+        // Fallback path for early startup or missing intrinsics: scale by an
+        // approximate camera tangent half-FOV.
         outCropWidth  = (std::max)(32, (int)std::lround((cropRadiusTan / kCameraTanHalfX) * frameWidth));
         outCropHeight = (std::max)(32, (int)std::lround((cropRadiusTan / kCameraTanHalfY) * frameHeight));
     }
@@ -510,6 +591,9 @@ static void computePythonCropSize(
 
 static bool startPhospheneBridge(PhospheneBridge& bridge)
 {
+    // Winsock is process-global on Windows and must be initialized before any
+    // socket calls. This bridge uses one UDP socket for sending and one bound
+    // UDP socket for receiving Python responses.
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         fprintf(stderr, "[UDP] WSAStartup failed\n");
@@ -549,6 +633,8 @@ static bool startPhospheneBridge(PhospheneBridge& bridge)
         std::vector<uint8_t> packet(UDP_CHUNK_SIZE + 64);
 
         while (bridge.running.load()) {
+            // Use a timeout on recvfrom so the thread periodically checks the
+            // running flag and can shut down cleanly.
             sockaddr_in from{};
             int fromLen = sizeof(from);
             int bytes = recvfrom(
@@ -575,6 +661,9 @@ static bool startPhospheneBridge(PhospheneBridge& bridge)
             }
 
             if (bytes == (int)sizeof(PythonConfigAckPacket)) {
+                // Python confirms config per eye. Until this arrives, C++ keeps
+                // sending config packets with frames so Python can recover if it
+                // started late.
                 PythonConfigAckPacket ack{};
                 std::memcpy(&ack, packet.data(), sizeof(ack));
 
@@ -606,6 +695,8 @@ static bool startPhospheneBridge(PhospheneBridge& bridge)
 
             RxAssembly& assembly = bridge.assemblies[eye][hdr.frameId];
             if (assembly.total == 0) {
+                // First chunk seen for this frame. Allocate the chunk table; the
+                // remaining chunks may arrive in any order.
                 assembly.total = hdr.chunkCount;
                 assembly.received = 0;
                 assembly.chunks.resize(hdr.chunkCount);
@@ -616,6 +707,8 @@ static bool startPhospheneBridge(PhospheneBridge& bridge)
             }
 
             if (assembly.chunks[hdr.chunkIndex].empty()) {
+                // Ignore duplicate chunks. UDP can drop packets, and user-space
+                // resend logic could also create duplicates.
                 assembly.chunks[hdr.chunkIndex].assign(
                     packet.data() + sizeof(CppFrameChunkHeader),
                     packet.data() + bytes);
@@ -623,6 +716,8 @@ static bool startPhospheneBridge(PhospheneBridge& bridge)
             }
 
             if (assembly.received == assembly.total) {
+                // Reconstruct the complete grayscale crop and publish it for the
+                // render loop. The render loop will upload it to GL.
                 std::vector<uint8_t> joined;
                 size_t totalBytes = 0;
                 for (const auto& c : assembly.chunks) totalBytes += c.size();
@@ -655,6 +750,8 @@ static bool startPhospheneBridge(PhospheneBridge& bridge)
 static void stopPhospheneBridge(PhospheneBridge& bridge)
 {
     if (bridge.sendSock != INVALID_SOCKET) {
+        // Nudge the Python side to stop listening/processing if it honors this
+        // one-byte shutdown control packet.
         uint8_t shutdown = SHUTDOWN_BYTE;
         sendto(
             bridge.sendSock,
@@ -689,6 +786,9 @@ static PythonConfigPacket buildPythonConfigPacket(
     const CapturedEyeFrame* frame,
     int eye)
 {
+    // Helper for constructing config packets from the latest known capture
+    // metadata. This is currently not used by sendPythonConfig(), but documents
+    // the intended packet shape in one place.
     PythonConfigPacket cfg{};
     cfg.opcode = CONFIG_OPCODE;
     cfg.eye = (uint8_t)eye;
@@ -715,6 +815,8 @@ static PythonConfigPacket buildPythonConfigPacket(
 
 static bool sendPythonConfigPacket(PhospheneBridge& bridge, const PythonConfigPacket& cfg)
 {
+    // Sends an already-built config packet. The active code path uses
+    // sendPythonConfig(), which builds and sends in one function.
     const int sent = sendto(
         bridge.sendSock,
         reinterpret_cast<const char*>(&cfg),
@@ -738,6 +840,8 @@ static bool sendPythonConfigPacket(PhospheneBridge& bridge, const PythonConfigPa
 
 static bool sendPythonConfig(PhospheneBridge& bridge, const CapturedEyeFrame* frame, int eye)
 {
+    // Config is sent per eye because left/right streams can have independent
+    // camera intrinsics and Python returns independent phosphene crops.
     PythonConfigPacket cfg{};
     cfg.opcode = CONFIG_OPCODE;
     cfg.eye = (uint8_t)eye;
@@ -783,6 +887,8 @@ static void sendFrameToPython(
 {
     if (!bridge.running.load()) return;
 
+    // Throttle Python work so camera capture can run faster than the phosphene
+    // processing loop without flooding UDP or the Python process.
     const auto now = std::chrono::steady_clock::now();
     const auto elapsedMs = std::chrono::duration<double, std::milli>(now - bridge.lastSendTime[eye]).count();
     if (elapsedMs < kPythonSendIntervalMs) {
@@ -807,6 +913,8 @@ static void sendFrameToPython(
     }
 
     const uint32_t frameId = (uint32_t)(frame.frameNumber & 0xffffffffu);
+    // Use the latest gaze value written by the render loop. These tangent
+    // coordinates tell Python where to crop/process relative to the camera frame.
     const float gx = bridge.gazeTanX[eye].load();
     const float gy = bridge.gazeTanY[eye].load();
 
@@ -816,6 +924,8 @@ static void sendFrameToPython(
     std::vector<uint8_t> packet(sizeof(PythonFrameChunkHeader) + UDP_CHUNK_SIZE);
 
     for (uint32_t i = 0; i < chunkCount; ++i) {
+        // UDP has no stream semantics, so every packet carries enough metadata
+        // for Python to reassemble the frame without relying on order.
         const size_t off = (size_t)i * UDP_CHUNK_SIZE;
         const size_t payloadBytes = (std::min)((size_t)UDP_CHUNK_SIZE, totalBytes - off);
 
@@ -843,6 +953,8 @@ static void sendFrameToPython(
 
 static bool uploadLatestPhospheneTexture(PhospheneBridge& bridge, int eye, GLuint tex, int& texWidth, int& texHeight)
 {
+    // Pull the latest complete Python result out under the mutex, then release
+    // the lock before doing OpenGL work. Only the render thread should touch GL.
     PhospheneFrame latest{};
     {
         std::lock_guard<std::mutex> lock(bridge.mutex);
@@ -858,6 +970,8 @@ static bool uploadLatestPhospheneTexture(PhospheneBridge& bridge, int eye, GLuin
     glBindTexture(GL_TEXTURE_2D, tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     if (latest.width != texWidth || latest.height != texHeight) {
+        // Reallocate only when Python changes crop size. Normal frames only need
+        // the cheaper sub-image upload below.
         glTexImage2D(
             GL_TEXTURE_2D,
             0,
@@ -886,15 +1000,16 @@ static bool uploadLatestPhospheneTexture(PhospheneBridge& bridge, int eye, GLuin
 }
 
 // ---------------------------------------------------------------------------
-// Left camera capture pipeline
+// Eye camera capture pipeline
 // ---------------------------------------------------------------------------
 
 struct EyeCameraCapture {
+    // One capture state per eye. The Varjo callback writes "latest"; the saver
+    // thread waits on cv, copies the frame, and forwards it to Python.
     std::mutex mutex;
     std::condition_variable cv;
     CapturedEyeFrame latest;
     bool hasNewFrame = false;
-    bool firstFrameSaved = false;
     std::atomic<bool> running{false};
     std::thread saverThread;
     varjo_StreamId streamId = varjo_InvalidId;
@@ -905,114 +1020,17 @@ struct EyeCameraCapture {
     struct PhospheneBridge* bridge = nullptr;
 };
 
-static inline uint8_t clampToByte(int v)
-{
-    return (uint8_t)((v < 0) ? 0 : (v > 255) ? 255 : v);
-}
-
-static std::vector<uint8_t> nv12ToBgra(const uint8_t* src, int width, int height, int rowStride)
-{
-    const uint8_t* yPlane = src;
-    const uint8_t* uvPlane = src + rowStride * height;
-    std::vector<uint8_t> bgra(width * height * 4);
-
-    for (int y = 0; y < height; ++y) {
-        const uint8_t* yRow = yPlane + y * rowStride;
-        const uint8_t* uvRow = uvPlane + (y / 2) * rowStride;
-        uint8_t* dstRow = bgra.data() + y * width * 4;
-
-        for (int x = 0; x < width; ++x) {
-            int Y = yRow[x];
-            int U = uvRow[(x & ~1) + 0];
-            int V = uvRow[(x & ~1) + 1];
-
-            int C = Y - 16;
-            int D = U - 128;
-            int E = V - 128;
-            if (C < 0) C = 0;
-
-            int R = (298 * C + 409 * E + 128) >> 8;
-            int G = (298 * C - 100 * D - 208 * E + 128) >> 8;
-            int B = (298 * C + 516 * D + 128) >> 8;
-
-            dstRow[x * 4 + 0] = clampToByte(B);
-            dstRow[x * 4 + 1] = clampToByte(G);
-            dstRow[x * 4 + 2] = clampToByte(R);
-            dstRow[x * 4 + 3] = 255;
-        }
-    }
-
-    return bgra;
-}
-
-#pragma pack(push, 1)
-struct BmpFileHeader {
-    uint16_t bfType;
-    uint32_t bfSize;
-    uint16_t bfReserved1;
-    uint16_t bfReserved2;
-    uint32_t bfOffBits;
-};
-
-struct BmpInfoHeader {
-    uint32_t biSize;
-    int32_t  biWidth;
-    int32_t  biHeight;
-    uint16_t biPlanes;
-    uint16_t biBitCount;
-    uint32_t biCompression;
-    uint32_t biSizeImage;
-    int32_t  biXPelsPerMeter;
-    int32_t  biYPelsPerMeter;
-    uint32_t biClrUsed;
-    uint32_t biClrImportant;
-};
-#pragma pack(pop)
-
-static bool writeBmp32(const char* path, int width, int height, const std::vector<uint8_t>& bgra)
-{
-    FILE* f = nullptr;
-#ifdef _MSC_VER
-    fopen_s(&f, path, "wb");
-#else
-    f = fopen(path, "wb");
-#endif
-    if (!f) return false;
-
-    const uint32_t imageSize = (uint32_t)bgra.size();
-
-    BmpFileHeader fileHeader{};
-    fileHeader.bfType = 0x4D42; // BM
-    fileHeader.bfOffBits = sizeof(BmpFileHeader) + sizeof(BmpInfoHeader);
-    fileHeader.bfSize = fileHeader.bfOffBits + imageSize;
-
-    BmpInfoHeader infoHeader{};
-    infoHeader.biSize = sizeof(BmpInfoHeader);
-    infoHeader.biWidth = width;
-    infoHeader.biHeight = -height; // top-down
-    infoHeader.biPlanes = 1;
-    infoHeader.biBitCount = 32;
-    infoHeader.biCompression = 0; // BI_RGB
-    infoHeader.biSizeImage = imageSize;
-
-    fwrite(&fileHeader, sizeof(fileHeader), 1, f);
-    fwrite(&infoHeader, sizeof(infoHeader), 1, f);
-    fwrite(bgra.data(), 1, bgra.size(), f);
-    fclose(f);
-    return true;
-}
-
 static void cameraSaverThreadMain(EyeCameraCapture* capture)
 {
-    CreateDirectoryA("captures", nullptr);
-
-    auto lastWrite = std::chrono::steady_clock::now() - std::chrono::seconds(10);
-    const char* eyeName = (capture->eye == 0) ? "left" : "right";
+    // Runs once per eye. It intentionally performs UDP sending away from the
+    // Varjo DataStream callback so the callback can return quickly.
 
     while (capture->running.load()) {
         CapturedEyeFrame frame;
         {
             std::unique_lock<std::mutex> lock(capture->mutex);
+            // Sleep until the callback publishes a new CPU copy or shutdown is
+            // requested.
             capture->cv.wait(lock, [&]() {
                 return !capture->running.load() || capture->hasNewFrame;
             });
@@ -1025,34 +1043,9 @@ static void cameraSaverThreadMain(EyeCameraCapture* capture)
             continue;
         }
 
-        auto now = std::chrono::steady_clock::now();
-        const bool timeToRefreshLatest =
-            (now - lastWrite) >= std::chrono::milliseconds(500);
-
-        if (!capture->firstFrameSaved || timeToRefreshLatest) {
-            std::vector<uint8_t> bgra = nv12ToBgra(
-                frame.nv12.data(), frame.width, frame.height, frame.rowStride);
-
-            if (!capture->firstFrameSaved) {
-                char firstPath[256];
-                std::snprintf(firstPath, sizeof(firstPath),
-                              "captures/%s_first_frame_%lld.bmp",
-                              eyeName, (long long)frame.frameNumber);
-                if (writeBmp32(firstPath, frame.width, frame.height, bgra)) {
-                    printf("[CAM] saved %s\n", firstPath);
-                    capture->firstFrameSaved = true;
-                }
-            }
-
-            char latestPath[256];
-            std::snprintf(latestPath, sizeof(latestPath),
-                          "captures/%s_latest.bmp", eyeName);
-            if (writeBmp32(latestPath, frame.width, frame.height, bgra)) {
-                lastWrite = now;
-            }
-        }
-
         if (capture->bridge) {
+            // The same latest camera frame is also the input to Python's
+            // phosphene generation pipeline.
             sendFrameToPython(*capture->bridge, frame, capture->eye);
         }
     }
@@ -1070,6 +1063,9 @@ static void onEyeCameraFrame(
     varjo_Session* session,
     void* userData)
 {
+    // Varjo invokes this callback from its DataStream machinery whenever a
+    // distorted-color camera frame is available. Keep work here minimal: copy
+    // the frame, capture metadata/intrinsics, notify the worker thread.
     if (!frame || !userData) return;
     if (frame->type != varjo_StreamType_DistortedColor) return;
     if (!(frame->dataFlags & varjo_DataFlag_Buffer)) return;
@@ -1077,6 +1073,8 @@ static void onEyeCameraFrame(
     EyeCameraCaptureSet* set = reinterpret_cast<EyeCameraCaptureSet*>(userData);
 
     for (int eye = 0; eye < 2; ++eye) {
+        // One callback can contain both left and right channels. Fan the frame
+        // out to whichever per-eye captures are active.
         EyeCameraCapture* capture = set->captures[eye];
         if (!capture || !capture->running.load()) continue;
 
@@ -1091,6 +1089,8 @@ static void onEyeCameraFrame(
             varjo_GetBufferId(session, frame->id, frame->frameNumber, channel);
         if (bufferId == varjo_InvalidId) continue;
 
+        // Lock while reading Varjo's buffer. The data pointer is only valid for
+        // the locked interval, so copy it before unlocking.
         varjo_LockDataStreamBuffer(session, bufferId);
         varjo_BufferMetadata meta = varjo_GetBufferMetadata(session, bufferId);
 
@@ -1100,6 +1100,7 @@ static void onEyeCameraFrame(
 
             if (src && meta.byteSize > 0) {
                 std::lock_guard<std::mutex> lock(capture->mutex);
+                // Publish a full CPU-owned copy for the saver/sender thread.
                 capture->latest.eye = capture->eye;
                 capture->latest.width = meta.width;
                 capture->latest.height = meta.height;
@@ -1110,6 +1111,8 @@ static void onEyeCameraFrame(
                 std::memcpy(capture->latest.nv12.data(), src, (size_t)meta.byteSize);
                 capture->latest.hasIntrinsics = false;
                 if (frame->dataFlags & varjo_DataFlag_Intrinsics) {
+                    // Intrinsics let Python convert gaze tangent radius to exact
+                    // crop pixels instead of using the fallback FOV estimate.
                     varjo_CameraIntrinsics2 intr = varjo_GetCameraIntrinsics2(session, frame->id, frame->frameNumber, channel);
                     capture->latest.hasIntrinsics = true;
                     capture->latest.intrinsicsModel = (int)intr.model;
@@ -1138,6 +1141,9 @@ static bool startEyeCameraCaptures(
     EyeCameraCaptureSet& set,
     varjo_StreamId& outStreamId)
 {
+    // Find the best available CPU-readable NV12 distorted-color stream that has
+    // both eye channels. CPU/NV12 is chosen because it can be copied directly to
+    // Python.
     outStreamId = varjo_InvalidId;
 
     const int32_t count = varjo_GetDataStreamConfigCount(session);
@@ -1155,6 +1161,7 @@ static bool startEyeCameraCaptures(
     int64_t bestScore = -1;
 
     for (const auto& cfg : configs) {
+        // Score prefers higher resolution, with frame rate as a small tie-break.
         if (cfg.streamType != varjo_StreamType_DistortedColor) continue;
         if (cfg.bufferType != varjo_BufferType_CPU) continue;
         if ((cfg.channelFlags & wantFlags) != wantFlags) continue;
@@ -1174,6 +1181,8 @@ static bool startEyeCameraCaptures(
 
     // Both eye captures share the chosen stream metadata.
     for (EyeCameraCapture* cap : {&leftCapture, &rightCapture}) {
+        // Start worker threads before starting the stream so the first callback
+        // can immediately hand off frames.
         cap->streamId = best->streamId;
         cap->streamWidth = best->width;
         cap->streamHeight = best->height;
@@ -1220,6 +1229,7 @@ static void stopEyeCameraCaptures(
     EyeCameraCaptureSet& set,
     varjo_StreamId streamId)
 {
+    // Stop the Varjo stream first so no new callbacks race with teardown.
     if (streamId != varjo_InvalidId) {
         varjo_StopDataStream(session, streamId);
     }
@@ -1243,6 +1253,7 @@ static void stopEyeCameraCaptures(
 
 int main()
 {
+    // OpenGL must be ready before creating Varjo GL swapchains.
     if (!createGLContext()) { fprintf(stderr, "GL context failed\n"); return 1; }
     loadGLFunctions();
     printf("[OK] OpenGL: %s\n", (const char*)glGetString(GL_VERSION));
@@ -1256,6 +1267,8 @@ int main()
         mrAvailable = varjo_GetPropertyBool(session, varjo_PropertyKey_MRAvailable);
     }
     if (mrAvailable) {
+        // This asks Varjo Base to composite the real camera video behind our
+        // submitted transparent layer.
         varjo_MRSetVideoRender(session, varjo_True);
         varjo_Error e = varjo_GetError(session);
         if (e != varjo_NoError)
@@ -1268,6 +1281,8 @@ int main()
 
     varjo_GazeInit(session);
     {
+        // Gaze is optional for session startup, but the overlay is gaze-driven,
+        // so report any initialization issue clearly.
         varjo_Error e = varjo_GetError(session);
         if (e != varjo_NoError)
             printf("[WARN] GazeInit: %s\n", varjo_GetErrorDesc(e));
@@ -1277,6 +1292,8 @@ int main()
 
     PhospheneBridge phospheneBridge{};
 
+    // Two per-eye camera states share one UDP bridge. Each worker thread will
+    // send its eye's camera frames to Python and receive eye-specific masks.
     EyeCameraCapture cameraCapture[2];
     cameraCapture[0].eye = 0;
     cameraCapture[0].bridge = &phospheneBridge;
@@ -1296,9 +1313,13 @@ int main()
 
     const float kSpotRadiusTan = 0.24f;
     const float kSoftEdgeTan   = 0.04f;
+    // Python generates the phosphene mask for the solid inner area of the spot,
+    // excluding the soft alpha edge.
     const float kPhospheneRadiusTan = kSpotRadiusTan - kSoftEdgeTan;
 
     for (int e = 0; e < 2; ++e) {
+        // Before real frames arrive, initialize crop/texture sizes from stream
+        // metadata. Later frames with intrinsics may refine these values.
         computePythonCropSize(
             cameraCapture[e].streamWidth,
             cameraCapture[e].streamHeight,
@@ -1321,6 +1342,8 @@ int main()
     const int viewCount = varjo_GetViewCount(session);
     printf("[OK] viewCount=%d\n", viewCount);
 
+    // Dynamic foveation can expose four views: left/right context and
+    // left/right focus. All of them need overlay rendering.
     std::vector<varjo_Viewport> viewports = calculateViewports(
         session, varjo_TextureSize_Type_DynamicFoveation);
     // std::vector<varjo_Viewport> viewports = calculateViewports(
@@ -1330,6 +1353,8 @@ int main()
     printf("[OK] Atlas %dx%d\n", totalW, totalH);
 
     varjo_SwapChainConfig2 cfg{};
+    // Triple buffering lets Varjo consume one image while the app renders into
+    // another, reducing stalls.
     cfg.numberOfTextures = 3;
     cfg.textureWidth     = totalW;
     cfg.textureHeight    = totalH;
@@ -1351,6 +1376,9 @@ int main()
     std::vector<GLuint> fbos(cfg.numberOfTextures);
     glGenFramebuffers(cfg.numberOfTextures, fbos.data());
     for (int i = 0; i < cfg.numberOfTextures; i++) {
+        // Varjo owns the swapchain images; convert each one to its OpenGL
+        // texture handle and attach it to an FBO so normal GL rendering can draw
+        // into it.
         varjo_Texture vTex = varjo_GetSwapChainImage(swapchain, i);
         textures[i] = varjo_ToGLTexture(vTex);
         glBindFramebuffer(GL_FRAMEBUFFER, fbos[i]);
@@ -1390,6 +1418,8 @@ int main()
     GLuint phospheneTexture[2] = {0, 0};
     glGenTextures(2, phospheneTexture);
     for (int e = 0; e < 2; ++e) {
+        // One single-channel texture per eye. Python returns grayscale bytes,
+        // so GL_R8 is enough and the shader expands it to RGBA.
         glBindTexture(GL_TEXTURE_2D, phospheneTexture[e]);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -1424,6 +1454,8 @@ int main()
 
     std::vector<varjo_LayerMultiProjView> views(viewCount);
     for (int i = 0; i < viewCount; i++) {
+        // Each Varjo view points at a sub-rectangle of the same swapchain atlas.
+        // Projection and view matrices are filled every frame below.
         memset(&views[i], 0, sizeof(views[i]));
         const varjo_Viewport& vp = viewports[i];
 
@@ -1433,6 +1465,8 @@ int main()
     }
 
     varjo_LayerMultiProj projLayer{};
+    // The layer is transparent except where the shaders draw alpha. With MR
+    // video pass-through enabled, transparent pixels reveal the real cameras.
     projLayer.header.type  = varjo_LayerMultiProjType;
     projLayer.header.flags = varjo_LayerFlag_BlendMode_AlphaBlend;
     projLayer.space        = varjo_SpaceLocal;
@@ -1446,15 +1480,18 @@ int main()
 
     varjo_FrameInfo* frameInfo = varjo_CreateFrameInfo(session);
 
-    printf("     Parallel left-camera capture writes captures/left_latest.bmp\n");
+    printf("     Parallel camera capture forwards frames to Python over UDP\n");
     printf("     Press ESC to quit.\n");
 
     int fc = 0;
     while (true) {
+        // Simple local exit condition for the sample program.
         if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) break;
 
         varjo_Event evt{};
         while (varjo_PollEvent(session, &evt)) {
+            // MR camera status changes are useful diagnostics when pass-through
+            // suddenly disappears.
             if (evt.header.type == varjo_EventType_MRDeviceStatus) {
                 if (evt.data.mrDeviceStatus.status == varjo_MRDeviceStatus_Connected)
                     printf("[EVT] MR cameras connected\n");
@@ -1468,6 +1505,8 @@ int main()
         varjo_Gaze gaze{};
         bool gazeValid = false;
         {
+            // Grab the latest combined/per-eye gaze state. If invalid, the code
+            // keeps the previous tangent values so the overlay does not jump.
             varjo_Gaze g = varjo_GetGaze(session);
             if (g.status == varjo_GazeStatus_Valid) { gaze = g; gazeValid = true; }
         }
@@ -1477,12 +1516,15 @@ int main()
         int sci = 0;
         varjo_AcquireSwapChainImage(swapchain, &sci);
 
+        // Render into the acquired Varjo swapchain image.
         glBindFramebuffer(GL_FRAMEBUFFER, fbos[sci]);
         glViewport(0, 0, totalW, totalH);
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
         glEnable(GL_BLEND);
+        // Source colors are effectively premultiplied by their alpha in the
+        // shaders. This blend mode composites the overlay onto transparent black.
         glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 
         glBindVertexArray(vao);
@@ -1491,14 +1533,17 @@ int main()
         float gazeTanXPerEye[2] = {gazeTanX, gazeTanX};
         float gazeTanYPerEye[2] = {gazeTanY, gazeTanY};
 
-       if (gazeValid) {
-            float gazeTanXPerEye[2] = {gazeTanX, gazeTanX};
-            float gazeTanYPerEye[2] = {gazeTanY, gazeTanY};
+        if (gazeValid) {
+            // Convert a 3D gaze ray into tangent space. This is roughly the same
+            // coordinate system Varjo uses to describe each view frustum:
+            // tanX = x / z, tanY = y / z.
 
             const float kMinGz = 0.35f;
             const float kMaxTan = 1.5f;
 
             auto safeTan = [&](double fx, double fy, double fz, float& outX, float& outY) -> bool {
+                // Reject near-parallel or extreme rays; otherwise one bad gaze
+                // sample could fling the overlay far outside the useful view.
                 if (fabs(fz) < kMinGz) return false;
                 const float tx = (float)(fx / fz);
                 const float ty = (float)(fy / fz);
@@ -1518,6 +1563,9 @@ int main()
 
             // better binocular fixation if focus distance is usable
             if (gaze.focusDistance > 0.05 && gaze.focusDistance < 2.0) {
+                // If Varjo provides a usable fixation distance, compute the 3D
+                // fixation point and then express that same point relative to
+                // each eye. This improves binocular alignment.
                 const double px = gaze.gaze.origin[0] + gaze.gaze.forward[0] * gaze.focusDistance;
                 const double py = gaze.gaze.origin[1] + gaze.gaze.forward[1] * gaze.focusDistance;
                 const double pz = gaze.gaze.origin[2] + gaze.gaze.forward[2] * gaze.focusDistance;
@@ -1561,6 +1609,8 @@ int main()
             };
 
         for (int i = 0; i < viewCount; i++) {
+            // The FOV tangents and frameInfo matrices are per-view, so every
+            // atlas viewport gets its own projection/view metadata.
             varjo_FovTangents tangents = varjo_GetFovTangents(session, i);
             varjo_Matrix proj = varjo_GetProjectionMatrix(&tangents);
             varjo_UpdateNearFarPlanes(proj.value, varjo_ClipRangeZeroToOne, 0.01, 300.0);
@@ -1577,6 +1627,8 @@ int main()
             const float eyeGazeTanY = gazeTanYPerEye[eyeIdx];
 
             // Black spot
+            // Draw first so the phosphene overlay can appear inside/on top of
+            // the scotoma region.
             glUseProgram(blackSpotProgram);
             glUniform1f(locGazeTanX,       eyeGazeTanX);
             glUniform1f(locGazeTanY,       eyeGazeTanY);
@@ -1590,6 +1642,8 @@ int main()
             glDrawArrays(GL_TRIANGLES, 0, 3);
 
             // Phosphene overlay -- draw on ALL views, not just i < 2
+            // The shader samples the latest Python-returned grayscale mask for
+            // this eye and positions it at the same gaze tangent coordinate.
             glUseProgram(phospheneProgram);
             glUniform1f(locPGazeTanX,        eyeGazeTanX);
             glUniform1f(locPGazeTanY,        eyeGazeTanY);
@@ -1613,6 +1667,7 @@ int main()
 
         projLayer.header.flags = varjo_LayerFlag_BlendMode_AlphaBlend;
 
+        // Submit this frame's transparent overlay layer to Varjo.
         submitInfo.frameNumber = frameInfo->frameNumber;
         varjo_EndFrameWithLayers(session, &submitInfo);
 
@@ -1621,6 +1676,8 @@ int main()
 
     printf("Shutting down...\n");
 
+    // Tear down threads/streams before destroying the Varjo session or GL
+    // objects they depend on.
     stopEyeCameraCaptures(session, cameraCapture[0], cameraCapture[1], cameraSet, cameraStreamId);
     stopPhospheneBridge(phospheneBridge);
 
