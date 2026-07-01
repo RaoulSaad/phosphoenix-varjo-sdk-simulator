@@ -1,7 +1,7 @@
 # run settings
 run:
   resolution: [256,256] #[width,height] in pixels
-  view_angle: 16 #in degrees, horizontal view angle
+  view_angle: 48 #deg; shows the fixed implant's +/-24deg field to scale (== C++ kDeviceFieldTan tan(24)=0.45)
   origin: [0,0]
   min_angle: 0.001 #in degrees, minimal eccentricity
   fps: 35

@@ -28,5 +28,10 @@ target_link_directories(VarjoGazeDot PRIVATE "${VARJO_SDK_DIR}/lib")
 target_link_libraries(VarjoGazeDot PRIVATE
     VarjoLib
     opengl32
-    Ws2_32
+)
+
+add_custom_command(TARGET VarjoGazeDot POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${VARJO_SDK_DIR}/bin/VarjoLib.dll"
+        "$<TARGET_FILE_DIR:VarjoGazeDot>/VarjoLib.dll"
 )

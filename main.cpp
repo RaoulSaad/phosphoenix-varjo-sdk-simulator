@@ -21,10 +21,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#pragma comment(lib, "Ws2_32.lib")
+#include <windows.h>   // shared-memory transport (CreateFileMapping/MapViewOfFile)
 
 #include <GL/gl.h>
 #include "glext.h"
@@ -54,6 +51,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
 
 // ---------------------------------------------------------------------------
 // GL function pointers
@@ -181,8 +179,60 @@ static void destroyGLContext()
 }
 
 // ---------------------------------------------------------------------------
-// Shader: transparent background + black scotoma spot
+// Shader: transparent background + black spot
 // ---------------------------------------------------------------------------
+
+enum BlindnessMode {
+    BLINDNESS_MACULAR  = 0,
+    BLINDNESS_GLAUCOMA = 1,
+    BLINDNESS_FULL     = 2
+};
+
+static BlindnessMode gBlindnessMode = BLINDNESS_FULL;
+
+// Overlay geometry for one blindness type, all in tangent space (tan of the
+// angle away from gaze). One place so the shader uniforms, the Python crop size
+// and the startup texture allocation can never drift apart.
+//   spotRadiusTan      : boundary of the scotoma (macular) or clear tunnel
+//                        (glaucoma), measured from the gaze point -- this is the
+//                        DISEASE parameter and is what differs between modes
+//   softEdgeTan        : feather width of that boundary
+//   phospheneRadiusTan : half-size of the gaze-centred phosphene disc the fixed
+//                        implant produces. This is the DEVICE field and is the
+//                        SAME for every mode -- the electrodes do not move with
+//                        the diagnosis. It must match dynaphos' field, i.e.
+//                        phospheneRadiusTan == tan(view_angle/2) from params.yaml
+//                        (view_angle=48 deg -> tan(24) ~= 0.45), and the device
+//                        grid generate_device_coords.py reaches the same 24 deg.
+// The per-disease scotoma mask then decides which of these fixed phosphenes are
+// actually shown (the ones landing in the blind region).
+constexpr float kDeviceFieldTan = 0.45f;   // fixed implant's phosphene half-field (~24 deg)
+
+struct OverlayGeometry {
+    float spotRadiusTan;
+    float softEdgeTan;
+    float phospheneRadiusTan;
+};
+
+static OverlayGeometry overlayGeometryFor(BlindnessMode mode)
+{
+    switch (mode) {
+    case BLINDNESS_GLAUCOMA:
+        // Clear central tunnel (residual vision); the device's phosphenes show in
+        // the blind ring between the tunnel edge and the device field
+        // (~8.5..24 deg). Widen the tunnel (spotRadiusTan) for milder glaucoma.
+        return OverlayGeometry{ 0.15f, 0.04f, kDeviceFieldTan };
+    case BLINDNESS_FULL:
+        // Full blindness samples the whole frame in screen space, so spot radius
+        // is unused; the device field is the same fixed disc.
+        return OverlayGeometry{ 0.0f, 0.0f, kDeviceFieldTan };
+    case BLINDNESS_MACULAR:
+    default:
+        // Black central scotoma; the fixed central device fills it.
+        return OverlayGeometry{ 0.24f, 0.04f, kDeviceFieldTan };
+    }
+}
+
 
 static const char* g_vertSrc = R"(
 #version 330 core
@@ -212,21 +262,49 @@ uniform float viewBottom;
 uniform float spotRadiusTan;
 uniform float softEdgeTan;
 
+uniform int blindnessMode; // 0 = macular, 1 = glaucoma, 2 = full
+
+float blindnessMask(vec2 tanPos, vec2 gazeTan)
+{
+    float d = distance(tanPos, gazeTan);
+
+    // Macular degeneration:
+    // black in the center, transparent outside
+    if (blindnessMode == 0) {
+        return 1.0 - smoothstep(
+            spotRadiusTan - softEdgeTan,
+            spotRadiusTan,
+            d
+        );
+    }
+
+    // Glaucoma:
+    // transparent in central island, black in periphery
+    if (blindnessMode == 1) {
+        return smoothstep(
+            spotRadiusTan,
+            spotRadiusTan + softEdgeTan,
+            d
+        );
+    }
+
+    // Full blindness:
+    // black everywhere
+    if (blindnessMode == 2) {
+        return 1.0;
+    }
+
+    return 0.0;
+}
+
 void main() {
-    // Convert this pixel from local viewport UV to view tangent space
-    float pxTanX = mix(viewLeft,   viewRight,  vUV.x);
-    float pxTanY = mix(viewTop,    viewBottom, vUV.y);
+    float pxTanX = mix(viewLeft,  viewRight,  vUV.x);
+    float pxTanY = mix(viewTop,   viewBottom, vUV.y);
 
-    // Distance from the gaze point in angular tangent coordinates. Keeping the
-    // radius in tangent space makes the spot stable across differently sized
-    // Varjo views in the atlas.
-    vec2 diff = vec2(pxTanX - gazeTanX, pxTanY - gazeTanY);
-    float d = length(diff);
+    vec2 tanPos = vec2(pxTanX, pxTanY);
+    vec2 gazeTan = vec2(gazeTanX, gazeTanY);
 
-    // Fully opaque at the center, fading to transparent over softEdgeTan.
-    float alpha = 1.0 - smoothstep(spotRadiusTan - softEdgeTan,
-                                   spotRadiusTan,
-                                   d);
+    float alpha = blindnessMask(tanPos, gazeTan);
 
     fragColor = vec4(0.0, 0.0, 0.0, alpha);
 }
@@ -239,37 +317,84 @@ out vec4 fragColor;
 
 uniform float gazeTanX;
 uniform float gazeTanY;
+
 uniform float viewLeft;
 uniform float viewRight;
 uniform float viewTop;
 uniform float viewBottom;
+
 uniform float phospheneRadiusTan;
 uniform float phospheneOpacity;
 uniform sampler2D phospheneTex;
 
+uniform float spotRadiusTan;
+uniform float softEdgeTan;
+uniform int blindnessMode; // 0 = macular, 1 = glaucoma, 2 = full
+
+float blindnessMask(vec2 tanPos, vec2 gazeTan)
+{
+    float d = distance(tanPos, gazeTan);
+
+    // Macular degeneration:
+    // phosphenes only in center blind spot
+    if (blindnessMode == 0) {
+        return 1.0 - smoothstep(
+            spotRadiusTan - softEdgeTan,
+            spotRadiusTan,
+            d
+        );
+    }
+
+    // Glaucoma:
+    // phosphenes only in peripheral blind region
+    if (blindnessMode == 1) {
+        return smoothstep(
+            spotRadiusTan,
+            spotRadiusTan + softEdgeTan,
+            d
+        );
+    }
+
+    // Full blindness:
+    // phosphenes everywhere
+    if (blindnessMode == 2) {
+        return 1.0;
+    }
+
+    return 0.0;
+}
+
 void main() {
-    // Convert the current pixel to the same tangent coordinate system used for
-    // gaze, then sample the returned phosphene image around the gaze center.
     float pxTanX = mix(viewLeft,  viewRight,  vUV.x);
     float pxTanY = mix(viewTop,   viewBottom, vUV.y);
 
-    vec2 diff = vec2(pxTanX - gazeTanX, pxTanY - gazeTanY);
-    float radius = phospheneRadiusTan;
+    vec2 tanPos = vec2(pxTanX, pxTanY);
+    vec2 gazeTan = vec2(gazeTanX, gazeTanY);
 
-    if (abs(diff.x) > radius || abs(diff.y) > radius) {
-        // Outside the square bounding box of the circular overlay: emit fully
-        // transparent pixels so the MR camera pass-through remains visible.
+    float mask = blindnessMask(tanPos, gazeTan);
+
+    if (mask <= 0.001) {
         fragColor = vec4(0.0);
         return;
     }
 
-    // Map tangent-space offset [-radius, +radius] to texture UV [0, 1].
-    vec2 uv = diff / (2.0 * radius) + vec2(0.5, 0.5);
-    float p = texture(phospheneTex, uv).r * phospheneOpacity;
+    // Every mode feeds the fixed implant the same gaze-centred crop, so the
+    // phosphenes are always sampled relative to gaze and follow the eye. The
+    // blindness mask above decides where they show: the central disc (macular),
+    // the peripheral ring (glaucoma), or the whole device field (full blindness).
+    vec2 diff = tanPos - gazeTan;
+    float radius = phospheneRadiusTan;
 
-    // The texture is rectangular, so apply a circular mask in tangent space.
-    float circleMask = 1.0 - smoothstep(radius - 0.01, radius, length(diff));
-    float a = clamp(p * circleMask, 0.0, 1.0);
+    if (abs(diff.x) > radius || abs(diff.y) > radius) {
+        fragColor = vec4(0.0);
+        return;
+    }
+
+    vec2 uv = diff / (2.0 * radius) + vec2(0.5, 0.5);
+    float p = texture(phospheneTex, uv).r;
+
+    float a = clamp(p * mask * phospheneOpacity, 0.0, 1.0);
+
     fragColor = vec4(a, a, a, a);
 }
 )";
@@ -409,31 +534,63 @@ static int32_t getTotalHeight(const std::vector<varjo_Viewport>& vp) {
 
 
 // ---------------------------------------------------------------------------
-// UDP bridge to Python
+// Shared-memory bridge to Python (replaces the old UDP transport)
 // ---------------------------------------------------------------------------
+//
+// Two named, pagefile-backed sections, one per direction:
+//   cam  (C++ -> Python) : raw NV12 camera frames + per-frame gaze/metadata
+//   phos (Python -> C++) : 8-bit grayscale phosphene images
+//
+// Each section is [ Header | eye0 channel | eye1 channel ]; a channel is a
+// lock-free double buffer [ Ctrl | slot0 | slot1 ], slot = [ SlotMeta | bytes ].
+// Publish (single-producer/single-consumer, latest-wins): the producer writes
+// the free slot, stores latestIndex, then bumps publishSeq (release). The
+// consumer reads publishSeq, copies slot[latestIndex], re-reads publishSeq; if
+// it moved mid-copy it retries (seqlock). Double buffering means the producer
+// never overwrites the slot being read unless it laps the consumer, which the
+// re-check catches. No locks, no kernel events -- consumers poll publishSeq.
+//
+// The layout is fixed at compile time so both sides agree without negotiating;
+// mappings are sized to generous maxima and only touched pages use RAM.
 
-constexpr uint8_t FRAME_START   = 0xFF;
-constexpr uint8_t SHUTDOWN_BYTE = 0xFE;
-constexpr uint8_t CONFIG_OPCODE = 0xFD;
-constexpr uint8_t CONFIG_ACK_OPCODE = 0xFC;
-// Keep UDP datagrams comfortably below typical fragmentation limits while still
-// sending large NV12 frames in a small number of chunks.
-constexpr int UDP_CHUNK_SIZE    = 8000;
-constexpr int PYTHON_RECV_PORT  = 5000;
-constexpr int CPP_RECV_PORT     = 5001;
+static const char* kCamMapName  = "Local\\VarjoPhospheneCam";   // C++  -> Python
+static const char* kPhosMapName = "Local\\VarjoPhospheneOut";   // Python -> C++
+
+constexpr uint32_t SHM_MAGIC   = 0x50484D31;   // 'PHM1'
+constexpr uint32_t SHM_VERSION = 1;
+
+constexpr uint32_t SHM_FLAG_READY    = 1u << 0;
+constexpr uint32_t SHM_FLAG_SHUTDOWN = 1u << 1;
+
+constexpr uint32_t SHM_NUM_EYES  = 2;
+constexpr uint32_t SHM_NUM_SLOTS = 2;          // double buffer
+
+constexpr uint32_t SHM_HEADER_SIZE   = 512;
+constexpr uint32_t SHM_CTRL_SIZE     = 64;
+constexpr uint32_t SHM_SLOTMETA_SIZE = 64;
+
+// Per-slot payload capacities (generous upper bounds; the actual bytes per frame
+// are carried in SlotMeta.byteSize). NV12 ~ w*h*3/2; grayscale ~ w*h.
+constexpr uint32_t CAM_SLOT_CAP  = 8u * 1024 * 1024;
+constexpr uint32_t PHOS_SLOT_CAP = 4u * 1024 * 1024;
+
+constexpr uint32_t CAM_SLOT_STRIDE   = SHM_SLOTMETA_SIZE + CAM_SLOT_CAP;
+constexpr uint32_t CAM_CHANNEL_SIZE  = SHM_CTRL_SIZE + SHM_NUM_SLOTS * CAM_SLOT_STRIDE;
+constexpr uint32_t CAM_MAP_SIZE      = SHM_HEADER_SIZE + SHM_NUM_EYES * CAM_CHANNEL_SIZE;
+
+constexpr uint32_t PHOS_SLOT_STRIDE  = SHM_SLOTMETA_SIZE + PHOS_SLOT_CAP;
+constexpr uint32_t PHOS_CHANNEL_SIZE = SHM_CTRL_SIZE + SHM_NUM_SLOTS * PHOS_SLOT_STRIDE;
+constexpr uint32_t PHOS_MAP_SIZE     = SHM_HEADER_SIZE + SHM_NUM_EYES * PHOS_CHANNEL_SIZE;
+
 // Fallback camera angular half-extents used only when Varjo intrinsics are not
 // available. These approximate how a tangent-space radius maps to camera pixels.
 constexpr float kCameraTanHalfX = 0.6f;
 constexpr float kCameraTanHalfY = 0.6f;
-constexpr double kPythonSendIntervalMs = 66.0; // ~15 FPS --> switch to 16.6 for 60 FPS if needed
+constexpr double kPythonSendIntervalMs = 0.0; // ~15 FPS --> switch to 16.6 for 60 FPS if needed
 
 #pragma pack(push, 1)
-struct PythonConfigPacket {
-    // Sent from C++ to Python before frame chunks. It tells Python how large the
-    // incoming camera frames are and how large a gaze-centered crop it should
-    // produce when returning the phosphene mask.
-    uint8_t opcode;
-    uint8_t eye;              // 0 = left, 1 = right
+struct ShmEyeConfig {
+    // Per-eye config, carried in the cam header (replaces the old config packet).
     int32_t cropWidth;
     int32_t cropHeight;
     int32_t frameWidth;
@@ -441,59 +598,113 @@ struct PythonConfigPacket {
     int32_t rowStride;
     int32_t intrinsicsModel;
     int32_t intrinsicsValid;
-    double focalLengthX;
-    double focalLengthY;
-    double principalPointX;
-    double principalPointY;
-    double distortionCoefficients[8];
+    int32_t reserved;
+    double  focalLengthX;
+    double  focalLengthY;
+    double  principalPointX;
+    double  principalPointY;
+    double  distortionCoefficients[8];
 };
 
-struct PythonConfigAckPacket {
-    // Sent from Python to C++ once Python has applied the latest per-eye config.
-    uint8_t opcode;
-    uint8_t eye;   // 0 = left, 1 = right
+struct ShmHeader {
+    // Lives at offset 0 of each mapping. The cam header additionally carries the
+    // per-eye config that used to travel in the UDP config packet.
+    uint32_t magic;
+    uint32_t version;
+    uint32_t flags;            // SHM_FLAG_READY | SHM_FLAG_SHUTDOWN
+    uint32_t configSeq;        // bumped when any eye config changes
+    int32_t  blindnessMode;    // C++ is the single source of truth
+    uint32_t reserved0;
+    ShmEyeConfig eye[SHM_NUM_EYES];
 };
 
-struct PythonFrameChunkHeader {
-    // Prefix for each C++ -> Python camera frame chunk. The payload immediately
-    // after this header is a slice of the raw NV12 frame buffer.
-    uint8_t opcode;
-    uint8_t eye;              // 0 = left, 1 = right
+struct ShmCtrl {
+    // One per channel, at the channel's base offset.
+    uint32_t latestIndex;      // index of the most-recently published slot
+    uint32_t publishSeq;       // monotonically increasing; consumer compares
+    uint32_t reserved[14];
+};
+
+struct ShmSlotMeta {
+    // Prefix of each slot; describes the payload bytes that follow it.
     uint32_t frameId;
-    uint32_t chunkIndex;
-    uint32_t chunkCount;
-    float gazeTanX;
-    float gazeTanY;
-};
-
-struct CppFrameChunkHeader {
-    // Prefix for each Python -> C++ phosphene mask chunk. The payload after this
-    // header is an 8-bit grayscale crop tile.
-    uint8_t opcode;
-    uint8_t eye;              // 0 = left, 1 = right
-    uint32_t frameId;
-    uint32_t chunkIndex;
-    uint32_t chunkCount;
+    uint32_t eye;
+    uint32_t width;
+    uint32_t height;
+    uint32_t rowStride;
+    uint32_t byteSize;         // actual payload bytes in this slot
+    float    gazeTanX;
+    float    gazeTanY;
+    uint32_t reserved[8];
 };
 #pragma pack(pop)
 
-struct PhospheneFrame {
-    // Latest complete grayscale mask received from Python for one eye. "dirty"
-    // tells the render thread that the GL texture needs an upload.
-    uint32_t frameId = 0;
-    int width = 0;
-    int height = 0;
-    bool dirty = false;
-    std::vector<uint8_t> gray;
-};
+static_assert(sizeof(ShmHeader)   <= SHM_HEADER_SIZE,   "ShmHeader exceeds SHM_HEADER_SIZE");
+static_assert(sizeof(ShmCtrl)     == SHM_CTRL_SIZE,     "ShmCtrl must equal SHM_CTRL_SIZE");
+static_assert(sizeof(ShmSlotMeta) == SHM_SLOTMETA_SIZE, "ShmSlotMeta must equal SHM_SLOTMETA_SIZE");
 
-struct RxAssembly {
-    // Temporary storage for a chunked UDP frame while not all chunks have
-    // arrived yet. Chunks can arrive out of order, so store by chunk index.
-    uint32_t total = 0;
-    size_t received = 0;
-    std::vector<std::vector<uint8_t>> chunks;
-};
+// --- lock-free double-buffer helpers (x86 TSO; fences are the compiler barrier) ---
+static inline uint8_t* shmChannel(uint8_t* base, int eye, uint32_t channelSize) {
+    return base + SHM_HEADER_SIZE + (uint32_t)eye * channelSize;
+}
+static inline uint8_t* shmSlot(uint8_t* channel, uint32_t slot, uint32_t slotStride) {
+    return channel + SHM_CTRL_SIZE + slot * slotStride;
+}
+
+// Producer: write meta + payload into the free slot, then publish it.
+static void shmPublish(uint8_t* channel, uint32_t slotStride, uint32_t slotCap,
+                       uint32_t& writeIndex, const ShmSlotMeta& metaIn,
+                       const void* payload, uint32_t byteSize)
+{
+    ShmCtrl* ctrl = reinterpret_cast<ShmCtrl*>(channel);
+    const uint32_t w = writeIndex;
+    uint8_t* slot = shmSlot(channel, w, slotStride);
+    const uint32_t n = (byteSize <= slotCap) ? byteSize : slotCap;
+
+    ShmSlotMeta* meta = reinterpret_cast<ShmSlotMeta*>(slot);
+    *meta = metaIn;
+    meta->byteSize = n;
+    std::memcpy(slot + SHM_SLOTMETA_SIZE, payload, n);
+
+    // Ensure payload + meta are visible before we advertise the slot.
+    std::atomic_thread_fence(std::memory_order_release);
+    ctrl->latestIndex = w;
+    std::atomic_thread_fence(std::memory_order_release);
+    ctrl->publishSeq  = ctrl->publishSeq + 1;   // the publish
+
+    writeIndex = (w + 1) % SHM_NUM_SLOTS;
+}
+
+// Consumer: return the latest published frame if it is newer than lastSeq.
+static bool shmConsume(uint8_t* channel, uint32_t slotStride,
+                       uint32_t& lastSeq, ShmSlotMeta& metaOut,
+                       std::vector<uint8_t>& payloadOut)
+{
+    ShmCtrl* ctrl = reinterpret_cast<ShmCtrl*>(channel);
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const uint32_t s1 = ctrl->publishSeq;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (s1 == lastSeq) return false;                 // nothing new
+        const uint32_t idx = ctrl->latestIndex;
+        if (idx >= SHM_NUM_SLOTS) return false;
+
+        uint8_t* slot = shmSlot(channel, idx, slotStride);
+        ShmSlotMeta m = *reinterpret_cast<const ShmSlotMeta*>(slot);
+        const uint32_t n = (m.byteSize <= slotStride - SHM_SLOTMETA_SIZE)
+                               ? m.byteSize : 0;
+        payloadOut.resize(n);
+        if (n) std::memcpy(payloadOut.data(), slot + SHM_SLOTMETA_SIZE, n);
+
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (ctrl->publishSeq == s1) {                    // no tear during copy
+            lastSeq = s1;
+            metaOut = m;
+            return true;
+        }
+        // producer published mid-copy; retry for a consistent snapshot
+    }
+    return false;   // producer racing very fast; pick it up next poll
+}
 
 struct CapturedEyeFrame {
     // CPU copy of one Varjo camera frame. The DataStream callback copies into
@@ -515,23 +726,22 @@ struct CapturedEyeFrame {
 };
 
 struct PhospheneBridge {
-    // Owns the UDP transport and shared state between:
-    //   - camera saver/sender threads,
-    //   - the UDP receive thread,
-    //   - the render loop that uploads GL textures.
+    // Owns the two shared-memory sections and the state shared between:
+    //   - camera saver/sender threads (produce into the cam section),
+    //   - the render loop (consumes the phos section, writes gaze).
     std::atomic<bool> running{false};
-    SOCKET sendSock = INVALID_SOCKET;
-    SOCKET recvSock = INVALID_SOCKET;
-    sockaddr_in pythonAddr{};
-    std::thread recvThread;
 
-    std::mutex mutex;
-    // Per-eye receive assembly, keyed by frameId per eye (index 0=L, 1=R)
-    std::unordered_map<uint32_t, RxAssembly> assemblies[2];
-    PhospheneFrame latest[2];
+    HANDLE   camMap  = nullptr;   // C++ -> Python (producer)
+    HANDLE   phosMap = nullptr;   // Python -> C++ (consumer)
+    uint8_t* camBase  = nullptr;
+    uint8_t* phosBase = nullptr;
+
+    // Per-eye publish/consume cursors (process-local, not shared).
+    uint32_t camWriteIndex[2] = {0, 0};   // producer's next cam slot
+    uint32_t phosLastSeq[2]   = {0, 0};   // last phos publishSeq we consumed
 
     // Gaze values are atomics because the render loop writes them while the
-    // camera sender threads read them to annotate outgoing frame chunks.
+    // camera sender threads read them to annotate outgoing frames.
     std::atomic<float> gazeTanX[2];   // [0]=L, [1]=R
     std::atomic<float> gazeTanY[2];
 
@@ -541,8 +751,8 @@ struct PhospheneBridge {
     int frameHeight[2]  = {0, 0};
     int rowStride[2]    = {0, 0};
 
-    std::atomic<bool> configAcked[2];
-    PythonConfigPacket lastConfig[2]{};
+    // Last config mirrored into the cam header, to detect changes (bump configSeq).
+    ShmEyeConfig lastConfig[2]{};
     bool haveLastConfig[2] = {false, false};
 
     std::chrono::steady_clock::time_point lastSendTime[2];
@@ -553,12 +763,12 @@ struct PhospheneBridge {
         gazeTanY[0].store(0.0f);
         gazeTanY[1].store(0.0f);
 
-        configAcked[0].store(false);
-        configAcked[1].store(false);
-
         lastSendTime[0] = std::chrono::steady_clock::now() - std::chrono::seconds(1);
         lastSendTime[1] = std::chrono::steady_clock::now() - std::chrono::seconds(1);
     }
+
+    ShmHeader* camHeader()  { return reinterpret_cast<ShmHeader*>(camBase); }
+    ShmHeader* phosHeader() { return reinterpret_cast<ShmHeader*>(phosBase); }
 };
 
 static void computePythonCropSize(
@@ -589,267 +799,38 @@ static void computePythonCropSize(
     if (outCropHeight & 1) ++outCropHeight;
 }
 
-static bool startPhospheneBridge(PhospheneBridge& bridge)
+static uint8_t* shmCreate(HANDLE& outMap, const char* name, uint32_t size)
 {
-    // Winsock is process-global on Windows and must be initialized before any
-    // socket calls. This bridge uses one UDP socket for sending and one bound
-    // UDP socket for receiving Python responses.
-    WSADATA wsa{};
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        fprintf(stderr, "[UDP] WSAStartup failed\n");
-        return false;
+    // Pagefile-backed named section. Either process may create it first; with a
+    // fixed size both agree, and the READY flag (set by C++ last) gates use.
+    outMap = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                                0, size, name);
+    if (!outMap) {
+        fprintf(stderr, "[SHM] CreateFileMapping('%s') failed: %lu\n", name, GetLastError());
+        return nullptr;
     }
-
-    bridge.sendSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    bridge.recvSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (bridge.sendSock == INVALID_SOCKET || bridge.recvSock == INVALID_SOCKET) {
-        fprintf(stderr, "[UDP] socket creation failed\n");
-        return false;
+    uint8_t* view = reinterpret_cast<uint8_t*>(
+        MapViewOfFile(outMap, FILE_MAP_ALL_ACCESS, 0, 0, size));
+    if (!view) {
+        fprintf(stderr, "[SHM] MapViewOfFile('%s') failed: %lu\n", name, GetLastError());
+        CloseHandle(outMap); outMap = nullptr;
+        return nullptr;
     }
-
-    int sendBuf = 4 * 1024 * 1024;
-    setsockopt(bridge.sendSock, SOL_SOCKET, SO_SNDBUF, (const char*)&sendBuf, sizeof(sendBuf));
-    int recvBuf = 4 * 1024 * 1024;
-    setsockopt(bridge.recvSock, SOL_SOCKET, SO_RCVBUF, (const char*)&recvBuf, sizeof(recvBuf));
-
-    DWORD timeoutMs = 100;
-    setsockopt(bridge.recvSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
-
-    sockaddr_in bindAddr{};
-    bindAddr.sin_family = AF_INET;
-    bindAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    bindAddr.sin_port = htons(CPP_RECV_PORT);
-    if (bind(bridge.recvSock, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
-        fprintf(stderr, "[UDP] bind failed on port %d\n", CPP_RECV_PORT);
-        return false;
-    }
-
-    bridge.pythonAddr.sin_family = AF_INET;
-    bridge.pythonAddr.sin_port = htons(PYTHON_RECV_PORT);
-    inet_pton(AF_INET, "127.0.0.1", &bridge.pythonAddr.sin_addr);
-
-    bridge.running.store(true);
-    bridge.recvThread = std::thread([&bridge]() {
-        std::vector<uint8_t> packet(UDP_CHUNK_SIZE + 64);
-
-        while (bridge.running.load()) {
-            // Use a timeout on recvfrom so the thread periodically checks the
-            // running flag and can shut down cleanly.
-            sockaddr_in from{};
-            int fromLen = sizeof(from);
-            int bytes = recvfrom(
-                bridge.recvSock,
-                reinterpret_cast<char*>(packet.data()),
-                (int)packet.size(),
-                0,
-                (sockaddr*)&from,
-                &fromLen);
-
-            if (bytes == SOCKET_ERROR) {
-                const int err = WSAGetLastError();
-                if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
-                    continue;
-                }
-                if (bridge.running.load()) {
-                    fprintf(stderr, "[UDP] recvfrom failed: %d\n", err);
-                }
-                continue;
-            }
-
-            if (bytes == 1 && packet[0] == SHUTDOWN_BYTE) {
-                continue;
-            }
-
-            if (bytes == (int)sizeof(PythonConfigAckPacket)) {
-                // Python confirms config per eye. Until this arrives, C++ keeps
-                // sending config packets with frames so Python can recover if it
-                // started late.
-                PythonConfigAckPacket ack{};
-                std::memcpy(&ack, packet.data(), sizeof(ack));
-
-                if (ack.opcode == CONFIG_ACK_OPCODE && ack.eye < 2) {
-                    bridge.configAcked[ack.eye].store(true);
-                    printf("[UDP] received config ACK for eye=%d\n", (int)ack.eye);
-                }
-                continue;
-            }
-
-            if (bytes < (int)sizeof(CppFrameChunkHeader)) {
-                continue;
-            }
-
-            CppFrameChunkHeader hdr{};
-            std::memcpy(&hdr, packet.data(), sizeof(hdr));
-            if (hdr.opcode != FRAME_START) {
-                continue;
-            }
-
-            const int payloadBytes = bytes - (int)sizeof(CppFrameChunkHeader);
-            if (payloadBytes <= 0) {
-                continue;
-            }
-
-            const int eye = (hdr.eye == 0) ? 0 : 1;
-
-            std::lock_guard<std::mutex> lock(bridge.mutex);
-
-            RxAssembly& assembly = bridge.assemblies[eye][hdr.frameId];
-            if (assembly.total == 0) {
-                // First chunk seen for this frame. Allocate the chunk table; the
-                // remaining chunks may arrive in any order.
-                assembly.total = hdr.chunkCount;
-                assembly.received = 0;
-                assembly.chunks.resize(hdr.chunkCount);
-            }
-
-            if (hdr.chunkIndex >= assembly.chunks.size()) {
-                continue;
-            }
-
-            if (assembly.chunks[hdr.chunkIndex].empty()) {
-                // Ignore duplicate chunks. UDP can drop packets, and user-space
-                // resend logic could also create duplicates.
-                assembly.chunks[hdr.chunkIndex].assign(
-                    packet.data() + sizeof(CppFrameChunkHeader),
-                    packet.data() + bytes);
-                assembly.received++;
-            }
-
-            if (assembly.received == assembly.total) {
-                // Reconstruct the complete grayscale crop and publish it for the
-                // render loop. The render loop will upload it to GL.
-                std::vector<uint8_t> joined;
-                size_t totalBytes = 0;
-                for (const auto& c : assembly.chunks) totalBytes += c.size();
-                joined.reserve(totalBytes);
-                for (const auto& c : assembly.chunks) {
-                    joined.insert(joined.end(), c.begin(), c.end());
-                }
-
-                if ((int)joined.size() == bridge.cropWidth[eye] * bridge.cropHeight[eye]) {
-                    bridge.latest[eye].frameId = hdr.frameId;
-                    bridge.latest[eye].width  = bridge.cropWidth[eye];
-                    bridge.latest[eye].height = bridge.cropHeight[eye];
-                    bridge.latest[eye].gray   = std::move(joined);
-                    bridge.latest[eye].dirty  = true;
-                }
-
-                bridge.assemblies[eye].erase(hdr.frameId);
-                if (bridge.assemblies[eye].size() > 32) {
-                    bridge.assemblies[eye].clear();
-                }
-            }
-        }
-    });
-
-    printf("[UDP] C++ receiver on 127.0.0.1:%d, sender to 127.0.0.1:%d\n",
-           CPP_RECV_PORT, PYTHON_RECV_PORT);
-    return true;
+    return view;
 }
 
-static void stopPhospheneBridge(PhospheneBridge& bridge)
+// Mirror the per-eye config into the cam header, bumping configSeq only when it
+// actually changes (so Python re-reads intrinsics/crop sizes on demand).
+static void writeHeaderConfig(PhospheneBridge& bridge, const CapturedEyeFrame* frame, int eye)
 {
-    if (bridge.sendSock != INVALID_SOCKET) {
-        // Nudge the Python side to stop listening/processing if it honors this
-        // one-byte shutdown control packet.
-        uint8_t shutdown = SHUTDOWN_BYTE;
-        sendto(
-            bridge.sendSock,
-            reinterpret_cast<const char*>(&shutdown),
-            1,
-            0,
-            (sockaddr*)&bridge.pythonAddr,
-            sizeof(bridge.pythonAddr));
-    }
+    if (!bridge.camBase) return;
 
-    bridge.running.store(false);
-
-    if (bridge.recvSock != INVALID_SOCKET) {
-        closesocket(bridge.recvSock);
-        bridge.recvSock = INVALID_SOCKET;
-    }
-
-    if (bridge.recvThread.joinable()) {
-        bridge.recvThread.join();
-    }
-
-    if (bridge.sendSock != INVALID_SOCKET) {
-        closesocket(bridge.sendSock);
-        bridge.sendSock = INVALID_SOCKET;
-    }
-
-    WSACleanup();
-}
-
-static PythonConfigPacket buildPythonConfigPacket(
-    const PhospheneBridge& bridge,
-    const CapturedEyeFrame* frame,
-    int eye)
-{
-    // Helper for constructing config packets from the latest known capture
-    // metadata. This is currently not used by sendPythonConfig(), but documents
-    // the intended packet shape in one place.
-    PythonConfigPacket cfg{};
-    cfg.opcode = CONFIG_OPCODE;
-    cfg.eye = (uint8_t)eye;
-    cfg.cropWidth = bridge.cropWidth[eye];
-    cfg.cropHeight = bridge.cropHeight[eye];
-    cfg.frameWidth = bridge.frameWidth[eye];
+    ShmEyeConfig cfg{};
+    cfg.cropWidth   = bridge.cropWidth[eye];
+    cfg.cropHeight  = bridge.cropHeight[eye];
+    cfg.frameWidth  = bridge.frameWidth[eye];
     cfg.frameHeight = bridge.frameHeight[eye];
-    cfg.rowStride = bridge.rowStride[eye];
-
-    if (frame && frame->hasIntrinsics) {
-        cfg.intrinsicsModel = frame->intrinsicsModel;
-        cfg.intrinsicsValid = 1;
-        cfg.focalLengthX = frame->focalLengthX;
-        cfg.focalLengthY = frame->focalLengthY;
-        cfg.principalPointX = frame->principalPointX;
-        cfg.principalPointY = frame->principalPointY;
-        for (int i = 0; i < 8; ++i) {
-            cfg.distortionCoefficients[i] = frame->distortionCoefficients[i];
-        }
-    }
-
-    return cfg;
-}
-
-static bool sendPythonConfigPacket(PhospheneBridge& bridge, const PythonConfigPacket& cfg)
-{
-    // Sends an already-built config packet. The active code path uses
-    // sendPythonConfig(), which builds and sends in one function.
-    const int sent = sendto(
-        bridge.sendSock,
-        reinterpret_cast<const char*>(&cfg),
-        sizeof(cfg),
-        0,
-        (sockaddr*)&bridge.pythonAddr,
-        sizeof(bridge.pythonAddr));
-
-    if (sent != (int)sizeof(cfg)) {
-        fprintf(stderr, "[UDP] failed to send config packet (eye=%d)\n", (int)cfg.eye);
-        return false;
-    }
-
-    printf("[UDP] sent config eye=%d: crop=%dx%d frame=%dx%d stride=%d intrinsics=%s model=%d fx=%.1f fy=%.1f cx=%.1f cy=%.1f\n",
-           (int)cfg.eye, cfg.cropWidth, cfg.cropHeight, cfg.frameWidth, cfg.frameHeight,
-           cfg.rowStride, cfg.intrinsicsValid ? "Y" : "N", cfg.intrinsicsModel,
-           cfg.focalLengthX, cfg.focalLengthY, cfg.principalPointX, cfg.principalPointY);
-
-    return true;
-}
-
-static bool sendPythonConfig(PhospheneBridge& bridge, const CapturedEyeFrame* frame, int eye)
-{
-    // Config is sent per eye because left/right streams can have independent
-    // camera intrinsics and Python returns independent phosphene crops.
-    PythonConfigPacket cfg{};
-    cfg.opcode = CONFIG_OPCODE;
-    cfg.eye = (uint8_t)eye;
-    cfg.cropWidth = bridge.cropWidth[eye];
-    cfg.cropHeight = bridge.cropHeight[eye];
-    cfg.frameWidth = bridge.frameWidth[eye];
-    cfg.frameHeight = bridge.frameHeight[eye];
-    cfg.rowStride = bridge.rowStride[eye];
+    cfg.rowStride   = bridge.rowStride[eye];
     if (frame && frame->hasIntrinsics) {
         cfg.intrinsicsModel = frame->intrinsicsModel;
         cfg.intrinsicsValid = 1;
@@ -858,26 +839,88 @@ static bool sendPythonConfig(PhospheneBridge& bridge, const CapturedEyeFrame* fr
         cfg.principalPointX = frame->principalPointX;
         cfg.principalPointY = frame->principalPointY;
         for (int i = 0; i < 8; ++i) cfg.distortionCoefficients[i] = frame->distortionCoefficients[i];
+    } else if (bridge.haveLastConfig[eye]) {
+        // No intrinsics on this frame: keep the last known ones.
+        const ShmEyeConfig& prev = bridge.lastConfig[eye];
+        cfg.intrinsicsModel = prev.intrinsicsModel;
+        cfg.intrinsicsValid = prev.intrinsicsValid;
+        cfg.focalLengthX = prev.focalLengthX;
+        cfg.focalLengthY = prev.focalLengthY;
+        cfg.principalPointX = prev.principalPointX;
+        cfg.principalPointY = prev.principalPointY;
+        for (int i = 0; i < 8; ++i) cfg.distortionCoefficients[i] = prev.distortionCoefficients[i];
     }
 
-    const int sent = sendto(
-        bridge.sendSock,
-        reinterpret_cast<const char*>(&cfg),
-        sizeof(cfg),
-        0,
-        (sockaddr*)&bridge.pythonAddr,
-        sizeof(bridge.pythonAddr));
-
-    if (sent != (int)sizeof(cfg)) {
-        fprintf(stderr, "[UDP] failed to send config packet (eye=%d)\n", eye);
-        return false;
+    ShmHeader* h = bridge.camHeader();
+    const bool modeChanged = (h->blindnessMode != (int)gBlindnessMode);
+    if (bridge.haveLastConfig[eye] && !modeChanged &&
+        std::memcmp(&cfg, &bridge.lastConfig[eye], sizeof(cfg)) == 0) {
+        return;   // nothing changed
     }
 
-    printf("[UDP] sent config eye=%d: crop=%dx%d frame=%dx%d stride=%d intrinsics=%s model=%d fx=%.1f fy=%.1f cx=%.1f cy=%.1f\n",
-           eye, cfg.cropWidth, cfg.cropHeight, cfg.frameWidth, cfg.frameHeight,
-           cfg.rowStride, cfg.intrinsicsValid ? "Y" : "N", cfg.intrinsicsModel,
-           cfg.focalLengthX, cfg.focalLengthY, cfg.principalPointX, cfg.principalPointY);
+    h->eye[eye] = cfg;
+    h->blindnessMode = (int)gBlindnessMode;
+    std::atomic_thread_fence(std::memory_order_release);
+    h->configSeq = h->configSeq + 1;
+    bridge.lastConfig[eye] = cfg;
+    bridge.haveLastConfig[eye] = true;
+
+    printf("[SHM] config eye=%d: blindness=%d crop=%dx%d frame=%dx%d stride=%d intrinsics=%s fx=%.1f fy=%.1f\n",
+           eye, h->blindnessMode, cfg.cropWidth, cfg.cropHeight, cfg.frameWidth, cfg.frameHeight,
+           cfg.rowStride, cfg.intrinsicsValid ? "Y" : "N", cfg.focalLengthX, cfg.focalLengthY);
+}
+
+static bool startPhospheneBridge(PhospheneBridge& bridge)
+{
+    bridge.camBase  = shmCreate(bridge.camMap,  kCamMapName,  CAM_MAP_SIZE);
+    bridge.phosBase = shmCreate(bridge.phosMap, kPhosMapName, PHOS_MAP_SIZE);
+    if (!bridge.camBase || !bridge.phosBase) return false;
+
+    // Reset control blocks for both directions/eyes (fresh pages are zero-filled,
+    // but a stale mapping surviving a crash would not be).
+    for (int eye = 0; eye < (int)SHM_NUM_EYES; ++eye) {
+        ShmCtrl* cc = reinterpret_cast<ShmCtrl*>(shmChannel(bridge.camBase,  eye, CAM_CHANNEL_SIZE));
+        ShmCtrl* pc = reinterpret_cast<ShmCtrl*>(shmChannel(bridge.phosBase, eye, PHOS_CHANNEL_SIZE));
+        cc->latestIndex = 0; cc->publishSeq = 0;
+        pc->latestIndex = 0; pc->publishSeq = 0;
+        bridge.camWriteIndex[eye] = 0;
+        bridge.phosLastSeq[eye]   = 0;
+    }
+
+    // Fill the initial config (fallback sizes from main), then publish READY last.
+    bridge.camHeader()->configSeq = 0;
+    bridge.camHeader()->blindnessMode = (int)gBlindnessMode;
+    for (int eye = 0; eye < (int)SHM_NUM_EYES; ++eye) writeHeaderConfig(bridge, nullptr, eye);
+
+    for (uint8_t* base : {bridge.camBase, bridge.phosBase}) {
+        ShmHeader* h = reinterpret_cast<ShmHeader*>(base);
+        h->version = SHM_VERSION;
+        std::atomic_thread_fence(std::memory_order_release);
+        h->magic = SHM_MAGIC;
+        std::atomic_thread_fence(std::memory_order_release);
+        h->flags = SHM_FLAG_READY;
+    }
+
+    bridge.running.store(true);
+    printf("[SHM] ready: cam='%s' (%.1f MB), phos='%s' (%.1f MB)\n",
+           kCamMapName, CAM_MAP_SIZE / 1048576.0,
+           kPhosMapName, PHOS_MAP_SIZE / 1048576.0);
     return true;
+}
+
+static void stopPhospheneBridge(PhospheneBridge& bridge)
+{
+    // Signal shutdown to Python via both headers, then tear down the mappings.
+    if (bridge.camBase)  bridge.camHeader()->flags  |= SHM_FLAG_SHUTDOWN;
+    if (bridge.phosBase) bridge.phosHeader()->flags |= SHM_FLAG_SHUTDOWN;
+    std::atomic_thread_fence(std::memory_order_release);
+
+    bridge.running.store(false);
+
+    if (bridge.camBase)  { UnmapViewOfFile(bridge.camBase);  bridge.camBase  = nullptr; }
+    if (bridge.phosBase) { UnmapViewOfFile(bridge.phosBase); bridge.phosBase = nullptr; }
+    if (bridge.camMap)   { CloseHandle(bridge.camMap);  bridge.camMap  = nullptr; }
+    if (bridge.phosMap)  { CloseHandle(bridge.phosMap); bridge.phosMap = nullptr; }
 }
 
 static void sendFrameToPython(
@@ -885,10 +928,10 @@ static void sendFrameToPython(
     const CapturedEyeFrame& frame,
     int eye)
 {
-    if (!bridge.running.load()) return;
+    if (!bridge.running.load() || !bridge.camBase) return;
 
     // Throttle Python work so camera capture can run faster than the phosphene
-    // processing loop without flooding UDP or the Python process.
+    // processing loop (currently 0 = publish every frame).
     const auto now = std::chrono::steady_clock::now();
     const auto elapsedMs = std::chrono::duration<double, std::milli>(now - bridge.lastSendTime[eye]).count();
     if (elapsedMs < kPythonSendIntervalMs) {
@@ -899,102 +942,90 @@ static void sendFrameToPython(
     bridge.frameWidth[eye] = frame.width;
     bridge.frameHeight[eye] = frame.height;
     bridge.rowStride[eye] = frame.rowStride;
-    computePythonCropSize(
-        bridge.frameWidth[eye],
-        bridge.frameHeight[eye],
-        0.24f - 0.04f,
-        &frame,
-        bridge.cropWidth[eye],
-        bridge.cropHeight[eye]);
-    
-        
-    if (!bridge.configAcked[eye].load()) {
-        sendPythonConfig(bridge, &frame, eye);
+    {
+        // Every mode uses the same gaze-centred crop sized to the fixed device
+        // field, so the phosphenes follow the eye. The per-disease mask (C++
+        // shader) decides which of them are shown.
+        const OverlayGeometry geom = overlayGeometryFor(gBlindnessMode);
+        computePythonCropSize(
+            bridge.frameWidth[eye],
+            bridge.frameHeight[eye],
+            geom.phospheneRadiusTan,
+            &frame,
+            bridge.cropWidth[eye],
+            bridge.cropHeight[eye]);
     }
 
-    const uint32_t frameId = (uint32_t)(frame.frameNumber & 0xffffffffu);
-    // Use the latest gaze value written by the render loop. These tangent
-    // coordinates tell Python where to crop/process relative to the camera frame.
-    const float gx = bridge.gazeTanX[eye].load();
-    const float gy = bridge.gazeTanY[eye].load();
+    // Publish current config (crop size / intrinsics / mode) into the cam header;
+    // this no-ops unless something changed and bumps configSeq when it does.
+    writeHeaderConfig(bridge, &frame, eye);
 
-    const size_t totalBytes = frame.nv12.size();
-    const uint32_t chunkCount = (uint32_t)((totalBytes + UDP_CHUNK_SIZE - 1) / UDP_CHUNK_SIZE);
-
-    std::vector<uint8_t> packet(sizeof(PythonFrameChunkHeader) + UDP_CHUNK_SIZE);
-
-    for (uint32_t i = 0; i < chunkCount; ++i) {
-        // UDP has no stream semantics, so every packet carries enough metadata
-        // for Python to reassemble the frame without relying on order.
-        const size_t off = (size_t)i * UDP_CHUNK_SIZE;
-        const size_t payloadBytes = (std::min)((size_t)UDP_CHUNK_SIZE, totalBytes - off);
-
-        PythonFrameChunkHeader hdr{};
-        hdr.opcode = FRAME_START;
-        hdr.eye = (uint8_t)eye;
-        hdr.frameId = frameId;
-        hdr.chunkIndex = i;
-        hdr.chunkCount = chunkCount;
-        hdr.gazeTanX = gx;
-        hdr.gazeTanY = gy;
-
-        std::memcpy(packet.data(), &hdr, sizeof(hdr));
-        std::memcpy(packet.data() + sizeof(hdr), frame.nv12.data() + off, payloadBytes);
-
-        sendto(
-            bridge.sendSock,
-            reinterpret_cast<const char*>(packet.data()),
-            (int)(sizeof(hdr) + payloadBytes),
-            0,
-            (sockaddr*)&bridge.pythonAddr,
-            sizeof(bridge.pythonAddr));
+    if (frame.nv12.empty()) return;
+    if (frame.nv12.size() > CAM_SLOT_CAP) {
+        fprintf(stderr, "[SHM] cam frame eye=%d too large (%zu > %u); dropping\n",
+                eye, frame.nv12.size(), CAM_SLOT_CAP);
+        return;
     }
+
+    ShmSlotMeta meta{};
+    meta.frameId   = (uint32_t)(frame.frameNumber & 0xffffffffu);
+    meta.eye       = (uint32_t)eye;
+    meta.width     = (uint32_t)frame.width;
+    meta.height    = (uint32_t)frame.height;
+    meta.rowStride = (uint32_t)frame.rowStride;
+    // Latest gaze written by the render loop; tells Python where to crop.
+    meta.gazeTanX  = bridge.gazeTanX[eye].load();
+    meta.gazeTanY  = bridge.gazeTanY[eye].load();
+
+    uint8_t* channel = shmChannel(bridge.camBase, eye, CAM_CHANNEL_SIZE);
+    shmPublish(channel, CAM_SLOT_STRIDE, CAM_SLOT_CAP,
+               bridge.camWriteIndex[eye], meta,
+               frame.nv12.data(), (uint32_t)frame.nv12.size());
 }
 
 static bool uploadLatestPhospheneTexture(PhospheneBridge& bridge, int eye, GLuint tex, int& texWidth, int& texHeight)
 {
-    // Pull the latest complete Python result out under the mutex, then release
-    // the lock before doing OpenGL work. Only the render thread should touch GL.
-    PhospheneFrame latest{};
-    {
-        std::lock_guard<std::mutex> lock(bridge.mutex);
-        if (!bridge.latest[eye].dirty) {
-            return false;
-        }
-        latest = bridge.latest[eye];
-        bridge.latest[eye].dirty = false;
-    }
+    // Consume the latest phosphene image from shared memory (render thread only),
+    // then upload it to the eye's GL texture.
+    if (!bridge.phosBase) return false;
 
-    if (latest.gray.empty()) return false;
+    static std::vector<uint8_t> gray;   // reused scratch; render thread is single
+    ShmSlotMeta meta{};
+    uint8_t* channel = shmChannel(bridge.phosBase, eye, PHOS_CHANNEL_SIZE);
+    if (!shmConsume(channel, PHOS_SLOT_STRIDE, bridge.phosLastSeq[eye], meta, gray)) {
+        return false;   // nothing newer than what we last uploaded
+    }
+    if (gray.empty() || meta.width == 0 || meta.height == 0) return false;
+    if (gray.size() != (size_t)meta.width * meta.height) return false;   // size mismatch
 
     glBindTexture(GL_TEXTURE_2D, tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    if (latest.width != texWidth || latest.height != texHeight) {
+    if ((int)meta.width != texWidth || (int)meta.height != texHeight) {
         // Reallocate only when Python changes crop size. Normal frames only need
         // the cheaper sub-image upload below.
         glTexImage2D(
             GL_TEXTURE_2D,
             0,
             GL_R8,
-            latest.width,
-            latest.height,
+            (GLsizei)meta.width,
+            (GLsizei)meta.height,
             0,
             GL_RED,
             GL_UNSIGNED_BYTE,
             nullptr);
-        texWidth = latest.width;
-        texHeight = latest.height;
+        texWidth = (int)meta.width;
+        texHeight = (int)meta.height;
     }
     glTexSubImage2D(
         GL_TEXTURE_2D,
         0,
         0,
         0,
-        latest.width,
-        latest.height,
+        (GLsizei)meta.width,
+        (GLsizei)meta.height,
         GL_RED,
         GL_UNSIGNED_BYTE,
-        latest.gray.data());
+        gray.data());
     glBindTexture(GL_TEXTURE_2D, 0);
     return true;
 }
@@ -1046,7 +1077,11 @@ static void cameraSaverThreadMain(EyeCameraCapture* capture)
         if (capture->bridge) {
             // The same latest camera frame is also the input to Python's
             // phosphene generation pipeline.
+            // std::chrono::milliseconds time_start = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
             sendFrameToPython(*capture->bridge, frame, capture->eye);
+            // std::chrono::milliseconds time_end = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch());
+            // std::chrono::milliseconds time_diff = time_end - time_start;
+            // printf("[TIMING] Eye %d: sendFrameToPython took %lld ms\n", capture->eye, time_diff.count());
         }
     }
 }
@@ -1311,11 +1346,14 @@ int main()
         printf("[OK] camera capture started (L+R on shared stream)\n");
     }
 
-    const float kSpotRadiusTan = 0.24f;
-    const float kSoftEdgeTan   = 0.04f;
-    // Python generates the phosphene mask for the solid inner area of the spot,
-    // excluding the soft alpha edge.
-    const float kPhospheneRadiusTan = kSpotRadiusTan - kSoftEdgeTan;
+    // Overlay geometry depends on the blindness type (see overlayGeometryFor):
+    //   Macular  -> black scotoma + phosphenes at the gaze centre.
+    //   Glaucoma -> clear central tunnel + phosphenes in the surrounding ring.
+    // Both keep the phosphenes anchored to gaze; only the mask/radii differ.
+    const OverlayGeometry geom      = overlayGeometryFor(gBlindnessMode);
+    const float kSpotRadiusTan      = geom.spotRadiusTan;
+    const float kSoftEdgeTan        = geom.softEdgeTan;
+    const float kPhospheneRadiusTan = geom.phospheneRadiusTan;
 
     for (int e = 0; e < 2; ++e) {
         // Before real frames arrive, initialize crop/texture sizes from stream
@@ -1402,6 +1440,7 @@ int main()
     GLint locViewBottom    = glGetUniformLocation(blackSpotProgram, "viewBottom");
     GLint locSpotRadiusTan = glGetUniformLocation(blackSpotProgram, "spotRadiusTan");
     GLint locSoftEdgeTan   = glGetUniformLocation(blackSpotProgram, "softEdgeTan");
+    GLint locBlindnessMode = glGetUniformLocation(blackSpotProgram, "blindnessMode");
 
     GLuint phospheneProgram = createProgram(g_phospheneFragSrc);
     GLint locPGazeTanX        = glGetUniformLocation(phospheneProgram, "gazeTanX");
@@ -1413,6 +1452,10 @@ int main()
     GLint locPPhospheneRadius = glGetUniformLocation(phospheneProgram, "phospheneRadiusTan");
     GLint locPPhospheneOp     = glGetUniformLocation(phospheneProgram, "phospheneOpacity");
     GLint locPPhospheneTex    = glGetUniformLocation(phospheneProgram, "phospheneTex");
+    GLint locPSpotRadiusTan = glGetUniformLocation(phospheneProgram, "spotRadiusTan");
+    GLint locPSoftEdgeTan   = glGetUniformLocation(phospheneProgram, "softEdgeTan");
+    GLint locPBlindnessMode = glGetUniformLocation(phospheneProgram, "blindnessMode");
+
     printf("[OK] Shaders\n");
 
     GLuint phospheneTexture[2] = {0, 0};
@@ -1638,6 +1681,7 @@ int main()
             glUniform1f(locViewBottom,     (float)tangents.bottom);
             glUniform1f(locSpotRadiusTan,  kSpotRadiusTan);
             glUniform1f(locSoftEdgeTan,    kSoftEdgeTan);
+            glUniform1i(locBlindnessMode, (int)gBlindnessMode);
             glViewport(vp.x, vp.y, vp.width, vp.height);
             glDrawArrays(GL_TRIANGLES, 0, 3);
 
@@ -1653,6 +1697,9 @@ int main()
             glUniform1f(locPViewBottom,      (float)tangents.bottom);
             glUniform1f(locPPhospheneRadius, kPhospheneRadiusTan);
             glUniform1f(locPPhospheneOp,     1.0f);
+            glUniform1f(locPSpotRadiusTan,   kSpotRadiusTan);
+            glUniform1f(locPSoftEdgeTan,     kSoftEdgeTan);
+            glUniform1i(locPBlindnessMode,   (int)gBlindnessMode);
 
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, phospheneTexture[eyeIdx]);

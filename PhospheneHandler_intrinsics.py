@@ -2,7 +2,7 @@ import sys
 import time
 import cv2
 import numpy as np
-import socket
+import mmap
 import struct
 import os
 import threading
@@ -13,6 +13,7 @@ import inspect
 import math
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 from dynaphos.image_processing import sobel_processor, canny_processor
 from dynaphos.simulator import GaussianSimulator
@@ -23,28 +24,106 @@ from base_processing_algorithm import BaseProcessingAlgorithm
 
 print("Python is running!")
 
-#####################
-# UDP Socket Values #
-#####################
-FRAME_START = 0xFF
-SHUTDOWN_BYTE = 0xFE
-CONFIG_OPCODE = 0xFD
-CONFIG_ACK_OPCODE = 0xFC
+#########################
+# Shared-memory layout  #
+#########################
+# Mirrors the C++ side in main.cpp exactly (same names/sizes). Two named,
+# pagefile-backed sections: cam (C++ -> Python NV12 frames) and phos
+# (Python -> C++ grayscale). Each is [ Header | eye0 channel | eye1 channel ];
+# a channel is a lock-free double buffer [ Ctrl | slot0 | slot1 ], slot =
+# [ SlotMeta | bytes ]. Publish/consume is the seqlock in shm_publish/shm_consume.
+SHM_CAM_NAME  = "Local\\VarjoPhospheneCam"
+SHM_PHOS_NAME = "Local\\VarjoPhospheneOut"
 
-# Packet layouts (all little-endian, struct-packed on the C++ side).
-#
-# PythonFrameChunkHeader (C++ -> Python frame packets):
-#   opcode(1) eye(1) frameId(4) chunkIndex(4) chunkCount(4) gazeTanX(4) gazeTanY(4)  = 22 bytes
-# CppFrameChunkHeader (Python -> C++ phosphene packets):
-#   opcode(1) eye(1) frameId(4) chunkIndex(4) chunkCount(4)                          = 14 bytes
-# PythonConfigPacket (C++ -> Python):
-#   opcode(1) eye(1) + 7 int32 + 12 double                                           = 126 bytes
-FRAME_HDR_FMT = "<BBIIIff"
-FRAME_HDR = struct.calcsize(FRAME_HDR_FMT)    # 22
-CPP_HDR_FMT = "<BBIII"
-CONFIG_FMT = "<BB7i12d"
-CONFIG_ACK_FMT = "<BB"
-CHUNK_SIZE = 8000
+SHM_MAGIC   = 0x50484D31   # 'PHM1'
+SHM_VERSION = 1
+SHM_FLAG_READY    = 1 << 0
+SHM_FLAG_SHUTDOWN = 1 << 1
+
+SHM_NUM_EYES  = 2
+SHM_NUM_SLOTS = 2          # double buffer
+
+SHM_HEADER_SIZE   = 512
+SHM_CTRL_SIZE     = 64
+SHM_SLOTMETA_SIZE = 64
+
+CAM_SLOT_CAP  = 8 * 1024 * 1024
+PHOS_SLOT_CAP = 4 * 1024 * 1024
+
+# struct formats (little-endian, packed) -- must match the C++ #pragma pack(1) structs
+SHM_HEADER_FMT   = "<IIIIiI"    # magic, version, flags, configSeq, blindnessMode, reserved0  (24 B)
+SHM_EYECFG_FMT   = "<8i12d"     # 8 int32 + 12 double                                          (128 B)
+SHM_SLOTMETA_FMT = "<6I2f8I"    # frameId,eye,w,h,rowStride,byteSize, gazeX,gazeY, reserved[8] (64 B)
+
+
+CAM_SLOT_STRIDE   = SHM_SLOTMETA_SIZE + CAM_SLOT_CAP
+CAM_CHANNEL_SIZE  = SHM_CTRL_SIZE + SHM_NUM_SLOTS * CAM_SLOT_STRIDE
+CAM_MAP_SIZE      = SHM_HEADER_SIZE + SHM_NUM_EYES * CAM_CHANNEL_SIZE
+PHOS_SLOT_STRIDE  = SHM_SLOTMETA_SIZE + PHOS_SLOT_CAP
+PHOS_CHANNEL_SIZE = SHM_CTRL_SIZE + SHM_NUM_SLOTS * PHOS_SLOT_STRIDE
+PHOS_MAP_SIZE     = SHM_HEADER_SIZE + SHM_NUM_EYES * PHOS_CHANNEL_SIZE
+
+
+def cam_channel_off(eye):
+    return SHM_HEADER_SIZE + eye * CAM_CHANNEL_SIZE
+
+
+def phos_channel_off(eye):
+    return SHM_HEADER_SIZE + eye * PHOS_CHANNEL_SIZE
+
+
+def read_header(mm):
+    magic, version, flags, config_seq, mode, _res = struct.unpack_from(SHM_HEADER_FMT, mm, 0)
+    return magic, version, flags, config_seq, mode
+
+
+def read_eye_config(mm, eye):
+    base = struct.calcsize(SHM_HEADER_FMT) + eye * struct.calcsize(SHM_EYECFG_FMT)
+    v = struct.unpack_from(SHM_EYECFG_FMT, mm, base)
+    return {
+        "crop_w": v[0], "crop_h": v[1], "frame_w": v[2], "frame_h": v[3],
+        "row_stride": v[4], "intr_model": v[5], "intr_valid": bool(v[6]),
+        "focal_x": v[8], "focal_y": v[9], "pp_x": v[10], "pp_y": v[11],
+        "coeffs": list(v[12:20]),
+    }
+
+
+def shm_consume(mm, channel_off, slot_stride, last_seq):
+    """Latest-wins seqlock read. Returns (new_last_seq, meta_tuple, payload) or
+    (last_seq, None, None) when there is nothing newer / a torn read persists."""
+    for _ in range(8):
+        s1 = struct.unpack_from("<I", mm, channel_off + 4)[0]   # publishSeq
+        if s1 == last_seq:
+            return last_seq, None, None
+        idx = struct.unpack_from("<I", mm, channel_off + 0)[0]  # latestIndex
+        if idx >= SHM_NUM_SLOTS:
+            return last_seq, None, None
+        so = channel_off + SHM_CTRL_SIZE + idx * slot_stride
+        meta = struct.unpack_from(SHM_SLOTMETA_FMT, mm, so)
+        n = meta[5]
+        if n > slot_stride - SHM_SLOTMETA_SIZE:
+            n = 0
+        payload = bytes(mm[so + SHM_SLOTMETA_SIZE: so + SHM_SLOTMETA_SIZE + n])
+        if struct.unpack_from("<I", mm, channel_off + 4)[0] == s1:  # no publish mid-copy
+            return s1, meta, payload
+        # producer published while we copied; retry for a consistent snapshot
+    return last_seq, None, None
+
+
+def shm_publish(mm, channel_off, slot_stride, slot_cap, write_index,
+                frame_id, eye, width, height, row_stride, gaze_x, gaze_y, payload):
+    """Write meta + payload into the free slot and publish it (x86 store order)."""
+    w = write_index
+    so = channel_off + SHM_CTRL_SIZE + w * slot_stride
+    n = min(len(payload), slot_cap)
+    struct.pack_into(SHM_SLOTMETA_FMT, mm, so,
+                     frame_id, eye, width, height, row_stride, n,
+                     gaze_x, gaze_y, 0, 0, 0, 0, 0, 0, 0, 0)
+    mm[so + SHM_SLOTMETA_SIZE: so + SHM_SLOTMETA_SIZE + n] = payload[:n]
+    struct.pack_into("<I", mm, channel_off + 0, w)                 # latestIndex
+    seq = struct.unpack_from("<I", mm, channel_off + 4)[0]
+    struct.pack_into("<I", mm, channel_off + 4, (seq + 1) & 0xFFFFFFFF)  # publishSeq (publish)
+    return (w + 1) % SHM_NUM_SLOTS
 
 EYE_LEFT = 0
 EYE_RIGHT = 1
@@ -53,14 +132,51 @@ NUM_EYES = 2
 VARJO_INTRINSICS_MODEL_OMNIDIR = 1
 VARJO_INTRINSICS_MODEL_RATIONAL = 2
 
-recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-recv_sock.bind(("0.0.0.0", 5000))
-recv_sock.settimeout(0.5)
-
-# Per-eye in-flight chunk assembly: frame_chunks[eye][frame_id] -> state dict
-frame_chunks = [{}, {}]
 IN_QUEUE_MAX = 8
+
+
+def open_shared_memory(timeout=60.0):
+    """Open both mappings and block until C++ marks them READY.
+
+    Either process may create the section first; the fixed size means both agree,
+    and the READY flag (set by C++ last) gates use. mmap(-1, tagname=...) opens the
+    existing section or creates a zero-filled one of the same size.
+    """
+    print("Opening shared memory, waiting for C++ (READY)...")
+    cam = mmap.mmap(-1, CAM_MAP_SIZE, tagname=SHM_CAM_NAME, access=mmap.ACCESS_WRITE)
+    phos = mmap.mmap(-1, PHOS_MAP_SIZE, tagname=SHM_PHOS_NAME, access=mmap.ACCESS_WRITE)
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        magic, _version, flags, _seq, _mode = read_header(cam)
+        if magic == SHM_MAGIC and (flags & SHM_FLAG_READY):
+            return cam, phos
+        time.sleep(0.01)
+    raise TimeoutError("C++ shared memory not READY within timeout")
+
+#########################
+# Blindness Mode Values #
+#########################
+BLINDNESS_MACULAR = 0
+BLINDNESS_GLAUCOMA = 1
+BLINDNESS_FULL = 2
+BLINDNESS_NAMES = {BLINDNESS_MACULAR: "macular", BLINDNESS_GLAUCOMA: "glaucoma", BLINDNESS_FULL: "full"}
+
+# C++ (gBlindnessMode) is the SINGLE SOURCE OF TRUTH for the blindness type: it
+# sends the mode in every config packet and Python adopts whatever it receives.
+# This value is only a fallback for the brief window before the first config.
+blindness_mode = BLINDNESS_MACULAR
+
+# Electrode grid.
+# A single fixed implant, used by every blindness type -- the electrodes do not
+# move with the diagnosis. grid_coords_full_field.yaml is a realistic V1 array:
+# mostly foveal (dense centre) but extending to ~24 deg, so the SAME device serves
+# central loss (macular fills the scotoma) and peripheral loss (glaucoma gets a
+# peripheral ring). The disease only changes the C++ scotoma mask -- which of these
+# fixed, gaze-locked phosphenes fall in the blind region and are therefore shown.
+# (dynaphos models a V1 implant; we use it as a retinotopic proxy for the LGN
+# target, so phosphene positions are approximate.)
+# Regenerate/tune the grid with generate_device_coords.py; its DEVICE_HALF_FOV_DEG
+# must match params.yaml view_angle (2x) and the C++ kDeviceFieldTan (tan24~=0.45).
 
 if len(sys.argv) == 2:
     python_dir = sys.argv[1].strip('"')
@@ -69,85 +185,18 @@ else:
     sys.exit(1)
 
 
-def parse_config_packet(pkt: bytes):
-    if len(pkt) < struct.calcsize(CONFIG_FMT):
-        raise ValueError("Config packet too small")
+cam_mm, phos_mm = open_shared_memory()
 
-    unpacked = struct.unpack_from(CONFIG_FMT, pkt, 0)
-    if unpacked[0] != CONFIG_OPCODE:
-        raise ValueError("Not a config packet")
-
-    eye = unpacked[1]
-    crop_w, crop_h, frame_w, frame_h, row_stride, intr_model, intr_valid = unpacked[2:9]
-    focal_x, focal_y, pp_x, pp_y = unpacked[9:13]
-    coeffs = list(unpacked[13:21])
-    print(f"[DEBUG] Raw Varjo coeffs (eye={eye}): {coeffs}")
-
-    return {
-        "eye": eye,
-        "crop_w": crop_w,
-        "crop_h": crop_h,
-        "frame_w": frame_w,
-        "frame_h": frame_h,
-        "row_stride": row_stride,
-        "intr_model": intr_model,
-        "intr_valid": bool(intr_valid),
-        "focal_x": focal_x,
-        "focal_y": focal_y,
-        "pp_x": pp_x,
-        "pp_y": pp_y,
-        "coeffs": coeffs,
-    }
-
-
-def send_config_ack(sock, eye, repeats=3):
-    pkt = struct.pack(CONFIG_ACK_FMT, CONFIG_ACK_OPCODE, eye)
-    for _ in range(repeats):
-        sock.sendto(pkt, ("127.0.0.1", 5001))
-    print(f"[PYTHON] Sent config ACK for eye={eye}")
-
-
-def wait_for_configs(sock, timeout=60.0):
-    """Block until we've received a config packet from both eyes."""
-    print("Waiting for config packets from C++ (both eyes)...")
-    configs = [None, None]
-    t_start = time.time()
-    while (configs[0] is None or configs[1] is None) and (time.time() - t_start < timeout):
-        try:
-            pkt, _ = sock.recvfrom(65535)
-        except socket.timeout:
-            continue
-
-        if pkt and pkt[0] == CONFIG_OPCODE:
-            cfg = parse_config_packet(pkt)
-            eye = cfg["eye"]
-            if eye not in (EYE_LEFT, EYE_RIGHT):
-                print(f"[PYTHON] Ignoring config with bad eye index {eye}")
-                continue
-            configs[eye] = cfg
-            print(
-                f"Received config from C++ (eye={eye}): crop=({cfg['crop_w']}, {cfg['crop_h']}) "
-                f"frame=({cfg['frame_w']}, {cfg['frame_h']}) stride={cfg['row_stride']} "
-                f"intrinsics={cfg['intr_valid']} model={cfg['intr_model']} "
-                f"fx={cfg['focal_x']:.2f} fy={cfg['focal_y']:.2f} cx={cfg['pp_x']:.2f} cy={cfg['pp_y']:.2f}"
-            )
-
-    if configs[0] is None or configs[1] is None:
-        missing = [i for i, c in enumerate(configs) if c is None]
-        raise TimeoutError(f"No config packet received for eye(s) {missing} within {timeout}s")
-
-    return configs
-
-
-runtime_cfgs = wait_for_configs(recv_sock)
+# Read the initial per-eye config + blindness mode straight from the cam header.
+_, _, _, last_config_seq, blindness_mode = read_header(cam_mm)
+runtime_cfgs = [read_eye_config(cam_mm, e) for e in range(NUM_EYES)]
 for _e, _c in enumerate(runtime_cfgs):
     print(
         f"[eye={_e}] Using crop={_c['crop_w']}x{_c['crop_h']}, "
         f"frame={_c['frame_w']}x{_c['frame_h']}, stride={_c['row_stride']}"
     )
-
-for eye in (EYE_LEFT, EYE_RIGHT):
-    send_config_ack(recv_sock, eye)
+print(f"[PYTHON] Blindness mode from C++: {blindness_mode} "
+      f"({BLINDNESS_NAMES.get(blindness_mode, '?')})")
 
 config_lock = threading.Lock()
 # Per-eye undistort maps cache.
@@ -341,7 +390,8 @@ class FilterApp(tk.Tk):
 
 def main(params: dict, algorithm, FilterApp):
     FilterApp.destroy()
-    coordinates_cortex = load_coordinates_from_yaml(python_dir + '/grid_coords_dipole_valid.yaml', n_coordinates=1500)
+    # Single fixed implant: the same full-field electrode grid for every mode.
+    coordinates_cortex = load_coordinates_from_yaml(python_dir + '/grid_coords_full_field.yaml')
     coordinates_cortex = Map(*coordinates_cortex)
     coordinates_visual_field = get_visual_field_coordinates_from_cortex_full(params['cortex_model'], coordinates_cortex)
     # One simulator per eye so temporal state (charge accumulation, etc.) stays independent.
@@ -354,96 +404,68 @@ def main(params: dict, algorithm, FilterApp):
     print("Cortex Model: ", params['cortex_model'])
     print("Resolution: ", resolution)
 
-    frame_queue = deque(maxlen=IN_QUEUE_MAX)
+    # Latest unprocessed camera frame per eye (drop-stale). Processed as a
+    # synchronised pair, so we only ever keep the newest frame for each eye.
+    pending = [None, None]   # pending[eye] = (img_in, gx, gy, frame_id)
     q_lock = threading.Lock()
     q_cond = threading.Condition(q_lock)
     stop_event = threading.Event()
 
     def shm_reader_loop():
+        global blindness_mode, last_config_seq
+        cam_last_seq = [0, 0]
         while not stop_event.is_set():
-            try:
-                pkt, _ = recv_sock.recvfrom(65535)
-            except socket.timeout:
-                continue
-
-            if len(pkt) == 1 and pkt[0] == SHUTDOWN_BYTE:
+            _magic, _ver, flags, config_seq, mode = read_header(cam_mm)
+            if flags & SHM_FLAG_SHUTDOWN:
                 print("Received shutdown from C++")
                 stop_event.set()
                 break
 
-            if pkt and pkt[0] == CONFIG_OPCODE:
-                try:
-                    new_cfg = parse_config_packet(pkt)
-                    eye = new_cfg["eye"]
-                    if eye not in (EYE_LEFT, EYE_RIGHT):
-                        print(f"[PYTHON] Ignoring config with bad eye index {eye}")
-                        continue
-                    with config_lock:
-                        runtime_cfgs[eye].update(new_cfg)
-                    print(
-                        f"[PYTHON] Updated config (eye={eye}): crop=({new_cfg['crop_w']}, {new_cfg['crop_h']}) "
-                        f"frame=({new_cfg['frame_w']}, {new_cfg['frame_h']}) stride={new_cfg['row_stride']} "
-                        f"intrinsics={new_cfg['intr_valid']} model={new_cfg['intr_model']}"
-                    )
-                    send_config_ack(recv_sock, eye, repeats=1)
-                except Exception as e:
-                    print(f"[PYTHON] Failed to parse config: {e}")
-                continue
-
-            if len(pkt) < FRAME_HDR or pkt[0] != FRAME_START:
-                continue
-
-            # Header: <BBIIIff>  opcode, eye, frameId, chunkIndex, chunkCount, gazeTanX, gazeTanY
-            _opcode, eye, frame_id, chunk_i, total, gx, gy = struct.unpack_from(FRAME_HDR_FMT, pkt, 0)
-            if eye not in (EYE_LEFT, EYE_RIGHT):
-                continue
-            payload = pkt[FRAME_HDR:]
-
-            eye_chunks = frame_chunks[eye]
-            st = eye_chunks.get(frame_id)
-            if st is None:
-                st = {"total": total, "gx": gx, "gy": gy, "chunks": [None] * total}
-                eye_chunks[frame_id] = st
-
-            if 0 <= chunk_i < st["total"]:
-                st["chunks"][chunk_i] = payload
-
-            if all(c is not None for c in st["chunks"]):
-                raw_nv12 = b"".join(st["chunks"])
-                del eye_chunks[frame_id]
-
+            # Config change (crop size / intrinsics / blindness mode)?
+            if config_seq != last_config_seq:
                 with config_lock:
-                    cfg = dict(runtime_cfgs[eye])
-                expected_bytes = cfg["row_stride"] * cfg["frame_h"] * 3 // 2
-                if len(raw_nv12) != expected_bytes:
-                    print(f"[PYTHON] Dropping frame eye={eye} id={frame_id}: expected {expected_bytes} bytes, got {len(raw_nv12)}")
+                    for e in range(NUM_EYES):
+                        runtime_cfgs[e] = read_eye_config(cam_mm, e)
+                blindness_mode = mode
+                last_config_seq = config_seq
+                c0 = runtime_cfgs[EYE_LEFT]
+                print(f"[PYTHON] Config updated (seq={config_seq}) blindness={mode} "
+                      f"crop=({c0['crop_w']},{c0['crop_h']}) frame=({c0['frame_w']},{c0['frame_h']}) "
+                      f"intrinsics={c0['intr_valid']}")
+
+            # Poll both eyes for a newer camera frame (latest-wins).
+            got = False
+            for eye in (EYE_LEFT, EYE_RIGHT):
+                cam_last_seq[eye], meta, payload = shm_consume(
+                    cam_mm, cam_channel_off(eye), CAM_SLOT_STRIDE, cam_last_seq[eye])
+                if meta is None:
+                    continue
+                got = True
+                frame_id, _m_eye, fw, fh, rs, _n, gx, gy = meta[:8]
+                expected = rs * fh * 3 // 2
+                if fw <= 0 or fh <= 0 or len(payload) != expected:
+                    print(f"[PYTHON] Dropping frame eye={eye} id={frame_id}: "
+                          f"expected {expected} bytes, got {len(payload)}")
                     continue
 
-                nv12 = np.frombuffer(raw_nv12, np.uint8)
-                y_plane = nv12[:cfg["row_stride"] * cfg["frame_h"]].reshape(cfg["frame_h"], cfg["row_stride"])[:, :cfg["frame_w"]]
-                uv_plane = nv12[cfg["row_stride"] * cfg["frame_h"]:].reshape(cfg["frame_h"] // 2, cfg["row_stride"])[:, :cfg["frame_w"]]
+                nv12 = np.frombuffer(payload, np.uint8)
+                y_plane = nv12[:rs * fh].reshape(fh, rs)[:, :fw]
+                uv_plane = nv12[rs * fh:].reshape(fh // 2, rs)[:, :fw]
                 tight_nv12 = np.vstack((y_plane, uv_plane))
                 img_in = cv2.cvtColor(tight_nv12, cv2.COLOR_YUV2BGR_NV12)
 
                 with q_cond:
-                    frame_queue.append((eye, img_in, gx, gy, frame_id))
+                    pending[eye] = (img_in, gx, gy, frame_id)   # keep only newest
                     q_cond.notify()
+
+            if not got:
+                time.sleep(0.001)   # poll gently when there is nothing new
 
     reader_thread = threading.Thread(target=shm_reader_loop, daemon=True)
     reader_thread.start()
 
-    send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
-    CPP_IP = "127.0.0.1"
-    CPP_PORT = 5001
-
-    def send_gray_in_chunks(gray_bytes: bytes, frame_id: int, eye: int):
-        total = (len(gray_bytes) + CHUNK_SIZE - 1) // CHUNK_SIZE
-        for i in range(total):
-            off = i * CHUNK_SIZE
-            chunk = gray_bytes[off:off + CHUNK_SIZE]
-            pkt = struct.pack(CPP_HDR_FMT, FRAME_START, eye, frame_id, i, total) + chunk
-            send_sock.sendto(pkt, (CPP_IP, CPP_PORT))
+    # Producer cursors for the phos (Python -> C++) channels.
+    phos_write_index = [0, 0]
 
     import torch
 
@@ -453,86 +475,72 @@ def main(params: dict, algorithm, FilterApp):
 
     print("Resolution:", resolution)
     print("Simulator type:", type(simulators[0]))
-    first = [True, True]
-    start_frame_in_time = time.time()
-    while True:
-        with q_cond:
-            if stop_event.is_set():
-                break
-            if not bool(frame_queue):
-                q_cond.wait(timeout=0.005)
-                continue
-            eye, img_in, gx, gy, frame_id = frame_queue.popleft()
-            print(f"[PYTHON] Time to capture frame from queue (eye={eye}): {(time.time() - start_frame_in_time) * 1000} ms")
-            start_frame_in_time = time.time()
 
+    def process_one_eye(eye, img_in, gx, gy, frame_id):
+        """Full per-eye pipeline: undistort -> gaze crop -> phosphenes -> bytes.
+        Returns (eye, gray_bytes, crop_w, crop_h, frame_id). Pure compute + no I/O,
+        so the two eyes can run concurrently and be published together."""
         with config_lock:
             cfg = dict(runtime_cfgs[eye])
 
-        start_time = time.time()
         undistorted = undistort_bgr(img_in, cfg, eye)
-
-        # Get the new_K that was used for undistortion
         _, _, new_K = get_undistort_maps(cfg, eye)
-
         if new_K is not None:
-            crop_fx = new_K[0, 0]
-            crop_fy = new_K[1, 1]
-            crop_cx = new_K[0, 2]
-            crop_cy = new_K[1, 2]
+            crop_fx, crop_fy = new_K[0, 0], new_K[1, 1]
+            crop_cx, crop_cy = new_K[0, 2], new_K[1, 2]
         else:
             crop_fx = cfg["focal_x"] * cfg["frame_w"]
             crop_fy = cfg["focal_y"] * cfg["frame_h"]
             crop_cx = cfg["pp_x"] * cfg["frame_w"]
             crop_cy = cfg["pp_y"] * cfg["frame_h"]
 
+        # Same gaze-centred crop for every mode; the C++ scotoma mask decides which
+        # phosphenes are actually shown (central disc / peripheral ring / whole field).
         frame_in = crop_with_black(
-            undistorted,
-            gx, gy,
+            undistorted, gx, gy,
             cfg["crop_w"], cfg["crop_h"],
-            crop_fx, crop_fy,
-            crop_cx, crop_cy,
+            crop_fx, crop_fy, crop_cx, crop_cy,
         )
-        end_time = time.time()
-
-        start_time = time.time()
         frame = cv2.resize(frame_in, resolution, cv2.INTER_LINEAR)
-        end_time = time.time()
-
-        start_time = time.time()
         stim_pattern = algorithm.process(frame, params, simulators[eye])
-        end_time = time.time()
-        print(f"[PYTHON] Algorithm processing time (eye={eye}): {(end_time - start_time) * 1000} ms")
-
-        start_time = time.time()
         phosphenes = simulators[eye](stim_pattern)
-        phosphenes = phosphenes.cpu().numpy() * 255
-        phosphenes = np.round(phosphenes).astype('uint8')
-        end_time = time.time()
-        print(f"[PYTHON] Phosphene generation time (eye={eye}): {(end_time - start_time) * 1000} ms")
+        phosphenes = np.round(phosphenes.cpu().numpy() * 255).astype('uint8')
+        resized = cv2.resize(phosphenes, (cfg["crop_w"], cfg["crop_h"]), interpolation=cv2.INTER_LINEAR)
+        gray = np.ascontiguousarray(resized[::-1]).tobytes()
+        return eye, gray, cfg["crop_w"], cfg["crop_h"], frame_id
 
-        start_time = time.time()
-        resizedPhosphenes = cv2.resize(phosphenes, (cfg["crop_w"], cfg["crop_h"]), interpolation=cv2.INTER_LINEAR)
-        end_time = time.time()
-        print(f"[PYTHON] Time to resize phosphenes (eye={eye}): {(end_time - start_time) * 1000} ms")
+    # Both eyes are processed as a synchronised pair: wait until a fresh frame is
+    # available for BOTH eyes, run them concurrently (cv2/torch release the GIL,
+    # so the work overlaps), then publish both back to back. This keeps L/R in
+    # lock-step and prevents either eye from starving.
+    pool = ThreadPoolExecutor(max_workers=NUM_EYES)
+    t_pair = time.time()
+    while True:
+        with q_cond:
+            while not stop_event.is_set() and (pending[EYE_LEFT] is None or pending[EYE_RIGHT] is None):
+                q_cond.wait(timeout=0.05)
+            if stop_event.is_set():
+                break
+            pair = list(pending)
+            pending[EYE_LEFT] = None
+            pending[EYE_RIGHT] = None
 
-        if first[eye]:
-            print(f"[eye={eye}] frame shape:", frame.shape, frame.dtype)
-            print(f"[eye={eye}] stim type:", type(stim_pattern))
-            print(f"[eye={eye}] stim shape:", getattr(stim_pattern, "shape", None))
-            print(f"[eye={eye}] stim dtype:", getattr(stim_pattern, "dtype", None))
-            print(f"[eye={eye}] stim device:", getattr(stim_pattern, "device", None))
-            first[eye] = False
+        futures = [pool.submit(process_one_eye, e, *pair[e]) for e in range(NUM_EYES)]
+        results = [f.result() for f in futures]   # both eyes done
+        for eye, gray, cw, ch, frame_id in results:   # publish the pair together
+            phos_write_index[eye] = shm_publish(
+                phos_mm, phos_channel_off(eye), PHOS_SLOT_STRIDE, PHOS_SLOT_CAP,
+                phos_write_index[eye], frame_id, eye, cw, ch, cw, 0.0, 0.0, gray)
 
-        start_time = time.time()
-        gray = np.ascontiguousarray(resizedPhosphenes[::-1]).tobytes()
-        send_gray_in_chunks(gray, frame_id, eye)
-        end_time = time.time()
-        print(f"[PYTHON] Send phosphenes to C++ (eye={eye}): {(end_time - start_time) * 1000} ms")
+        now = time.time()
+        print(f"[PYTHON] pair processed+published: {(now - t_pair) * 1000:.1f} ms "
+              f"({1.0 / max(now - t_pair, 1e-6):.0f} FPS/eye)")
+        t_pair = now
 
     stop_event.set()
     with q_cond:
         q_cond.notify_all()
+    pool.shutdown(wait=False)
     try:
         reader_thread.join(timeout=1.0)
     except Exception:
