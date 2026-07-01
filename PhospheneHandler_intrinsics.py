@@ -322,7 +322,7 @@ def crop_with_black(img, gaze_tan_x, gaze_tan_y, crop_w, crop_h, focal_x, focal_
 
     cx = pp_x + focal_x * gaze_tan_x
     cy = pp_y - focal_y * gaze_tan_y
-    print(f"[GAZE] gx = {gaze_tan_x}, gy = {gaze_tan_y}; cx = {cx}, cy = {cy}")
+    # print(f"[GAZE] gx = {gaze_tan_x}, gy = {gaze_tan_y}; cx = {cx}, cy = {cy}")
 
     left = int(math.floor(cx - crop_w / 2))
     top = int(math.floor(cy - crop_h / 2))
@@ -478,11 +478,16 @@ def main(params: dict, algorithm, FilterApp):
 
     def process_one_eye(eye, img_in, gx, gy, frame_id):
         """Full per-eye pipeline: undistort -> gaze crop -> phosphenes -> bytes.
-        Returns (eye, gray_bytes, crop_w, crop_h, frame_id). Pure compute + no I/O,
-        so the two eyes can run concurrently and be published together."""
+        Returns (eye, gray_bytes, crop_w, crop_h, frame_id, timings_ms). Pure
+        compute + no I/O, so the two eyes can run concurrently and publish together.
+        Note: torch CUDA is async, so `simulator` absorbs the GPU time that `algorithm`
+        dispatched (the .cpu() readback is where the GPU is actually waited on)."""
+        pc = time.perf_counter
+        t = {}
         with config_lock:
             cfg = dict(runtime_cfgs[eye])
 
+        t0 = pc()
         undistorted = undistort_bgr(img_in, cfg, eye)
         _, _, new_K = get_undistort_maps(cfg, eye)
         if new_K is not None:
@@ -493,29 +498,47 @@ def main(params: dict, algorithm, FilterApp):
             crop_fy = cfg["focal_y"] * cfg["frame_h"]
             crop_cx = cfg["pp_x"] * cfg["frame_w"]
             crop_cy = cfg["pp_y"] * cfg["frame_h"]
+        t["undistort"] = (pc() - t0) * 1000
 
         # Same gaze-centred crop for every mode; the C++ scotoma mask decides which
         # phosphenes are actually shown (central disc / peripheral ring / whole field).
+        t0 = pc()
         frame_in = crop_with_black(
             undistorted, gx, gy,
             cfg["crop_w"], cfg["crop_h"],
             crop_fx, crop_fy, crop_cx, crop_cy,
         )
+        t["crop"] = (pc() - t0) * 1000
+
+        t0 = pc()
         frame = cv2.resize(frame_in, resolution, cv2.INTER_LINEAR)
+        t["resize_in"] = (pc() - t0) * 1000
+
+        t0 = pc()
         stim_pattern = algorithm.process(frame, params, simulators[eye])
+        t["algorithm"] = (pc() - t0) * 1000
+
+        t0 = pc()
         phosphenes = simulators[eye](stim_pattern)
         phosphenes = np.round(phosphenes.cpu().numpy() * 255).astype('uint8')
+        t["simulator"] = (pc() - t0) * 1000
+
+        t0 = pc()
         resized = cv2.resize(phosphenes, (cfg["crop_w"], cfg["crop_h"]), interpolation=cv2.INTER_LINEAR)
         gray = np.ascontiguousarray(resized[::-1]).tobytes()
-        return eye, gray, cfg["crop_w"], cfg["crop_h"], frame_id
+        t["resize_out"] = (pc() - t0) * 1000
+
+        return eye, gray, cfg["crop_w"], cfg["crop_h"], frame_id, t
 
     # Both eyes are processed as a synchronised pair: wait until a fresh frame is
     # available for BOTH eyes, run them concurrently (cv2/torch release the GIL,
     # so the work overlaps), then publish both back to back. This keeps L/R in
     # lock-step and prevents either eye from starving.
     pool = ThreadPoolExecutor(max_workers=NUM_EYES)
-    t_pair = time.time()
+    pair_count = 0
     while True:
+        # (1) wait for a fresh frame on BOTH eyes
+        t_wait0 = time.perf_counter()
         with q_cond:
             while not stop_event.is_set() and (pending[EYE_LEFT] is None or pending[EYE_RIGHT] is None):
                 q_cond.wait(timeout=0.05)
@@ -524,18 +547,33 @@ def main(params: dict, algorithm, FilterApp):
             pair = list(pending)
             pending[EYE_LEFT] = None
             pending[EYE_RIGHT] = None
+        wait_ms = (time.perf_counter() - t_wait0) * 1000
 
+        # (2) process both eyes concurrently (wall time = the slower eye)
+        t_comp0 = time.perf_counter()
         futures = [pool.submit(process_one_eye, e, *pair[e]) for e in range(NUM_EYES)]
-        results = [f.result() for f in futures]   # both eyes done
-        for eye, gray, cw, ch, frame_id in results:   # publish the pair together
+        results = [f.result() for f in futures]
+        compute_ms = (time.perf_counter() - t_comp0) * 1000
+
+        # (3) publish the pair together into shared memory (the "transfer")
+        t_pub0 = time.perf_counter()
+        for eye, gray, cw, ch, frame_id, _t in results:
             phos_write_index[eye] = shm_publish(
                 phos_mm, phos_channel_off(eye), PHOS_SLOT_STRIDE, PHOS_SLOT_CAP,
                 phos_write_index[eye], frame_id, eye, cw, ch, cw, 0.0, 0.0, gray)
+        publish_ms = (time.perf_counter() - t_pub0) * 1000
 
-        now = time.time()
-        print(f"[PYTHON] pair processed+published: {(now - t_pair) * 1000:.1f} ms "
-              f"({1.0 / max(now - t_pair, 1e-6):.0f} FPS/eye)")
-        t_pair = now
+        pair_count += 1
+        if pair_count % 30 == 0:      # ~1 line/sec
+            total = wait_ms + compute_ms + publish_ms
+            by_eye = {r[0]: r[5] for r in results}
+            stages_l = " ".join(f"{k}={v:.1f}" for k, v in by_eye[EYE_LEFT].items())
+            stages_r = " ".join(f"{k}={v:.1f}" for k, v in by_eye[EYE_RIGHT].items())
+            print(f"[TIMING] pair#{pair_count} total={total:.1f}ms "
+                  f"({1000.0 / max(total, 1e-3):.0f} FPS/eye)  "
+                  f"wait={wait_ms:.1f}  compute={compute_ms:.1f}  publish={publish_ms:.2f}")
+            print(f"         L  {stages_l}")
+            print(f"         R  {stages_r}")
 
     stop_event.set()
     with q_cond:
