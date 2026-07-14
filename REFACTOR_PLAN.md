@@ -18,12 +18,12 @@ code change agreed: split the phosphene consume (shared-mem) from the GL upload.
 | File | Responsibility | Status |
 |---|---|---|
 | `pipeline_types.h/.cpp` | Shared types: `CameraFrame`, `BlindnessMode`, `OverlayGeometry`+`overlayGeometryFor`, `gBlindnessMode`, `GazeTan`, `Viewport`, `ViewTangents`, `NUM_EYES` | **DONE** |
-| `transport.h/.cpp` | Shared-memory module (the Python seam): `PhospheneBridge` + all SHM code | TODO |
-| `frame_source.h` | `IFrameSource` interface (the webcam seam) | TODO |
-| `varjo_source.h/.cpp` | `VarjoFrameSource : IFrameSource` — Varjo session, camera DataStream, gaze, XR swapchain + frame loop | TODO |
-| `renderer.h/.cpp` | GL context + loader + shaders + overlay draw + phosphene textures + FBOs | TODO |
-| `main.cpp` | Thin orchestrator: wire source → transport → renderer, run loop | TODO (rewrite) |
-| `CMakeLists.txt` | compile all `.cpp` | TODO |
+| `transport.h/.cpp` | Shared-memory module (the Python seam): `PhospheneBridge` + all SHM code | **DONE** |
+| `frame_source.h` | `IFrameSource` interface (the webcam seam) | **DONE** |
+| `varjo_source.h/.cpp` | `VarjoFrameSource : IFrameSource` — Varjo session, camera DataStream, gaze, XR swapchain + frame loop | **DONE** |
+| `renderer.h/.cpp` | GL context + loader + shaders + overlay draw + phosphene textures + FBOs | **DONE** |
+| `main.cpp` | Thin orchestrator: wire source → transport → renderer, run loop | **DONE** |
+| `CMakeLists.txt` | compile all `.cpp` | **DONE** |
 
 > NOTE: `pipeline_types.cpp` already defines `gBlindnessMode` and
 > `overlayGeometryFor`. These are **still also defined in `main.cpp`** (lines

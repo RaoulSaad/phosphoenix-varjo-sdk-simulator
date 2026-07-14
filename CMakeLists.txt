@@ -16,7 +16,12 @@ endif()
 
 message(STATUS "Varjo SDK: ${VARJO_SDK_DIR}")
 
-add_executable(VarjoGazeDot main.cpp)
+add_executable(VarjoGazeDot
+    main.cpp
+    pipeline_types.cpp
+    transport.cpp
+    varjo_source.cpp
+    renderer.cpp)
 
 target_include_directories(VarjoGazeDot PRIVATE
     "${VARJO_SDK_DIR}/include"
