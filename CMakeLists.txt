@@ -40,3 +40,9 @@ add_custom_command(TARGET VarjoGazeDot POST_BUILD
         "${VARJO_SDK_DIR}/bin/VarjoLib.dll"
         "$<TARGET_FILE_DIR:VarjoGazeDot>/VarjoLib.dll"
 )
+
+find_package(OpenCV REQUIRED)
+
+add_executable(opencvTest opencvTest.cpp 
+    webcam_source.cpp)
+target_link_libraries(opencvTest PRIVATE ${OpenCV_LIBS})
