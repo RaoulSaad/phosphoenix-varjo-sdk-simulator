@@ -46,6 +46,13 @@ public:
     // Disable blending and unbind the FBO.
     void endFrame();
 
+    // Opacity of the black blindness mask, 0..1. 1 = normal simulation (the
+    // mask fully occludes the MR passthrough); lower values let the real world
+    // show through underneath so phosphene alignment can be checked against it.
+    // Does not affect phosphene brightness.
+    void setMaskOpacity(float opacity);
+    float maskOpacity() const { return m_maskOpacity; }
+
     // Delete GL objects (programs, VAO, textures, FBOs). Call before the Varjo
     // swapchain/session are freed; the context stays alive for that.
     void shutdownGL();
@@ -69,10 +76,14 @@ private:
     int m_texWidth[NUM_EYES]  = {0, 0};
     int m_texHeight[NUM_EYES] = {0, 0};
 
+    // Debug/alignment aid; 1.0 is the normal simulation.
+    float m_maskOpacity = 1.0f;
+
     // Uniform locations — black spot program.
     int m_locGazeTanX = -1, m_locGazeTanY = -1;
     int m_locViewLeft = -1, m_locViewRight = -1, m_locViewTop = -1, m_locViewBottom = -1;
     int m_locSpotRadiusTan = -1, m_locSoftEdgeTan = -1, m_locBlindnessMode = -1;
+    int m_locMaskOpacity = -1;
 
     // Uniform locations — phosphene program.
     int m_locPGazeTanX = -1, m_locPGazeTanY = -1;

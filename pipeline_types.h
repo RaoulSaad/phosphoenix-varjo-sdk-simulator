@@ -25,9 +25,22 @@ enum BlindnessMode {
 // pipeline_types.cpp). C++ owns it; Python follows it via the cam header.
 extern BlindnessMode gBlindnessMode;
 
-// Fixed implant's phosphene half-field (~24 deg). Must match params.yaml
-// view_angle/2 on the Python side and generate_device_coords.py.
-constexpr float kDeviceFieldTan = 0.45f;
+// Fixed implant's phosphene half-field, as tan(half-FOV). This one constant
+// sets BOTH ends of the loop: computePythonCropSize() asks Python for a camera
+// crop spanning +/- this tangent, and the phosphene shader draws the image it
+// gets back across +/- this same tangent. So it must equal tan(view_angle / 2)
+// of the simulator producing that image AND the angular extent of that
+// simulator's phosphene coordinate map -- all three, or the world arrives at
+// the wrong scale (a crop wider than the array looks zoomed out).
+//   run_varjo.py -> config_viseon/simulator_config.yaml : view_angle 16
+//     DefaultCoordinateMap_1000_phosphenes spans +/-7.97 deg (measured), so the
+//     device field is 16 deg and this is tan(8 deg).
+//   PhospheneHandler_intrinsics.py -> params.yaml + grid_coords_full_field.yaml
+//     is a different, +/-24 deg array; that handler needs 0.45f and
+//     view_angle 48 instead. generate_device_coords.py's DEVICE_HALF_FOV_DEG
+//     belongs to that one too.
+// run_varjo.py re-derives this from the crop size and warns on mismatch.
+constexpr float kDeviceFieldTan = 0.1405f;   // tan(8 deg) -> +/-8 deg device field
 
 struct OverlayGeometry {
     float spotRadiusTan;        // scotoma (macular) / clear tunnel (glaucoma) boundary

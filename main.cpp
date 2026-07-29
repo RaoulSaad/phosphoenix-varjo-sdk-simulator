@@ -24,6 +24,7 @@
 #define NOMINMAX
 #include <windows.h>   // GetAsyncKeyState (ESC to quit)
 
+#include <cmath>    // lround (mask-opacity logging)
 #include <cstdio>
 #include <vector>
 
@@ -98,16 +99,33 @@ int main()
     renderer.initShaders();
     renderer.initPhospheneTextures(phospheneBridge.cropWidth, phospheneBridge.cropHeight);
 
-    printf("     Parallel camera capture forwards frames to Python over UDP\n");
+    printf("     Parallel camera capture forwards frames to Python over shared memory\n");
     printf("     Press ESC to quit.\n");
+    printf("     Keys 1-9 fade the blindness mask to 10%%-90%% so the real world\n"
+           "     shows through (for checking phosphene alignment); 0 restores the\n"
+           "     full simulation.\n");
 
     // Reused scratch for consumed phosphene bytes; the render thread is single.
     std::vector<uint8_t> phospheneGray;
 
-    int fc = 0;
     while (true) {
         // Simple local exit condition for the sample program.
         if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) break;
+
+        // Alignment aid: dim the mask so the MR passthrough is visible behind
+        // the phosphenes. Assigning the same value repeatedly is harmless, so
+        // no key-edge detection is needed.
+        for (int k = 0; k <= 9; ++k) {
+            if (GetAsyncKeyState('0' + k) & 0x8000) {
+                const float opacity = (k == 0) ? 1.0f : (float)k * 0.1f;
+                if (opacity != renderer.maskOpacity()) {
+                    renderer.setMaskOpacity(opacity);
+                    printf("[VIEW] blindness mask opacity = %d%% (passthrough %d%%)\n",
+                           (int)lround(opacity * 100.0f),
+                           (int)lround((1.0f - opacity) * 100.0f));
+                }
+            }
+        }
 
         source.pollEvents();
         source.waitSync();
@@ -148,8 +166,6 @@ int main()
         renderer.endFrame();
         source.releaseSwapchainImage();
         source.endFrameAndSubmit();
-
-        fc++;
     }
 
     printf("Shutting down...\n");

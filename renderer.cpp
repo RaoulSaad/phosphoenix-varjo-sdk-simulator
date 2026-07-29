@@ -181,6 +181,10 @@ uniform float softEdgeTan;
 
 uniform int blindnessMode; // 0 = macular, 1 = glaucoma, 2 = full
 
+// 1 = the mask fully occludes the passthrough (normal). Lower values reveal the
+// real world underneath, for checking that phosphenes land on their objects.
+uniform float maskOpacity;
+
 float blindnessMask(vec2 tanPos, vec2 gazeTan)
 {
     float d = distance(tanPos, gazeTan);
@@ -221,7 +225,7 @@ void main() {
     vec2 tanPos = vec2(pxTanX, pxTanY);
     vec2 gazeTan = vec2(gazeTanX, gazeTanY);
 
-    float alpha = blindnessMask(tanPos, gazeTan);
+    float alpha = blindnessMask(tanPos, gazeTan) * maskOpacity;
 
     fragColor = vec4(0.0, 0.0, 0.0, alpha);
 }
@@ -402,6 +406,7 @@ bool OverlayRenderer::initShaders()
     m_locSpotRadiusTan = glGetUniformLocation(m_blackSpotProgram, "spotRadiusTan");
     m_locSoftEdgeTan   = glGetUniformLocation(m_blackSpotProgram, "softEdgeTan");
     m_locBlindnessMode = glGetUniformLocation(m_blackSpotProgram, "blindnessMode");
+    m_locMaskOpacity   = glGetUniformLocation(m_blackSpotProgram, "maskOpacity");
 
     m_phospheneProgram = createProgram(g_phospheneFragSrc);
     m_locPGazeTanX        = glGetUniformLocation(m_phospheneProgram, "gazeTanX");
@@ -511,19 +516,23 @@ void OverlayRenderer::drawView(const Viewport& vp, const ViewTangents& t,
 {
     // Black spot
     // Draw first so the phosphene overlay can appear inside/on top of
-    // the scotoma region.
-    glUseProgram(m_blackSpotProgram);
-    glUniform1f(m_locGazeTanX,       gazeTanX);
-    glUniform1f(m_locGazeTanY,       gazeTanY);
-    glUniform1f(m_locViewLeft,       t.left);
-    glUniform1f(m_locViewRight,      t.right);
-    glUniform1f(m_locViewTop,        t.top);
-    glUniform1f(m_locViewBottom,     t.bottom);
-    glUniform1f(m_locSpotRadiusTan,  geom.spotRadiusTan);
-    glUniform1f(m_locSoftEdgeTan,    geom.softEdgeTan);
-    glUniform1i(m_locBlindnessMode,  (int)mode);
-    glViewport(vp.x, vp.y, vp.width, vp.height);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    // the scotoma region. Skipped entirely at zero opacity, which is the
+    // "show me the real world" case and saves a fullscreen pass.
+    if (m_maskOpacity > 0.0f) {
+        glUseProgram(m_blackSpotProgram);
+        glUniform1f(m_locGazeTanX,       gazeTanX);
+        glUniform1f(m_locGazeTanY,       gazeTanY);
+        glUniform1f(m_locViewLeft,       t.left);
+        glUniform1f(m_locViewRight,      t.right);
+        glUniform1f(m_locViewTop,        t.top);
+        glUniform1f(m_locViewBottom,     t.bottom);
+        glUniform1f(m_locSpotRadiusTan,  geom.spotRadiusTan);
+        glUniform1f(m_locSoftEdgeTan,    geom.softEdgeTan);
+        glUniform1i(m_locBlindnessMode,  (int)mode);
+        glUniform1f(m_locMaskOpacity,    m_maskOpacity);
+        glViewport(vp.x, vp.y, vp.width, vp.height);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
 
     // Phosphene overlay -- draw on ALL views, not just i < 2
     // The shader samples the latest Python-returned grayscale mask for
@@ -552,6 +561,11 @@ void OverlayRenderer::endFrame()
 {
     glDisable(GL_BLEND);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void OverlayRenderer::setMaskOpacity(float opacity)
+{
+    m_maskOpacity = (opacity < 0.0f) ? 0.0f : (opacity > 1.0f ? 1.0f : opacity);
 }
 
 void OverlayRenderer::shutdownGL()
