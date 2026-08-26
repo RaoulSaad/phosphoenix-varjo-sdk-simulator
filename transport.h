@@ -82,3 +82,10 @@ void publishCameraFrame(PhospheneBridge& bridge, const CameraFrame& frame, int e
 // texture upload is the renderer's half of the old uploadLatestPhospheneTexture.
 bool consumePhosphene(PhospheneBridge& bridge, int eye,
                       std::vector<uint8_t>& outGray, int& outWidth, int& outHeight);
+
+// Python announces the half-field tangent of the phosphene map it loaded by
+// writing the float into the phos header's reserved word (0 = no announcement,
+// e.g. the old PhospheneHandler). Call once per frame from the render loop:
+// adopts the value into gDeviceFieldTan so the camera crop and the shader
+// follow the map automatically. Returns true when the value changed.
+bool pollAnnouncedDeviceField(PhospheneBridge& bridge);

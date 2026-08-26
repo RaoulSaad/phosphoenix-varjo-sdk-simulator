@@ -396,6 +396,31 @@ void publishCameraFrame(PhospheneBridge& bridge, const CameraFrame& frame, int e
                frame.nv12.data(), (uint32_t)frame.nv12.size());
 }
 
+bool pollAnnouncedDeviceField(PhospheneBridge& bridge)
+{
+    // Python bit-casts its map's half-field tangent into the phos header's
+    // reserved0. Zero means "nothing announced" (fresh pages are zeroed and
+    // the old PhospheneHandler never writes it), so the compiled default in
+    // gDeviceFieldTan stays in effect.
+    if (!bridge.phosBase) return false;
+
+    uint32_t raw = phosHeader(bridge)->reserved0;
+    float announced;
+    std::memcpy(&announced, &raw, sizeof(announced));
+
+    // Sanity window: tan of ~0.6..80 deg half-field. Rejects zero/garbage.
+    if (!(announced > 0.01f && announced < 6.0f)) return false;
+
+    const float current = gDeviceFieldTan.load(std::memory_order_relaxed);
+    if (std::fabs(announced - current) < 1e-4f) return false;
+
+    gDeviceFieldTan.store(announced, std::memory_order_relaxed);
+    printf("[SHM] device field announced by Python: tan=%.4f (+/-%.1f deg). "
+           "Crop and shader follow.\n",
+           announced, std::atan(announced) * 180.0 / 3.14159265358979);
+    return true;
+}
+
 bool consumePhosphene(PhospheneBridge& bridge, int eye,
                       std::vector<uint8_t>& outGray, int& outWidth, int& outHeight)
 {

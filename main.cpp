@@ -61,7 +61,9 @@ int main()
     //   Macular  -> black scotoma + phosphenes at the gaze centre.
     //   Glaucoma -> clear central tunnel + phosphenes in the surrounding ring.
     // Both keep the phosphenes anchored to gaze; only the mask/radii differ.
-    const OverlayGeometry geom = overlayGeometryFor(gBlindnessMode);
+    // Startup copy only: the render loop re-fetches it every frame because the
+    // device field can change when Python announces its loaded map.
+    const OverlayGeometry startupGeom = overlayGeometryFor(gBlindnessMode);
 
     for (int e = 0; e < NUM_EYES; ++e) {
         // Before real frames arrive, initialize crop/texture sizes from stream
@@ -69,7 +71,7 @@ int main()
         computePythonCropSize(
             source.frameWidth(e),
             source.frameHeight(e),
-            geom.phospheneRadiusTan,
+            startupGeom.phospheneRadiusTan,
             nullptr,
             phospheneBridge.cropWidth[e],
             phospheneBridge.cropHeight[e]);
@@ -129,6 +131,12 @@ int main()
 
         source.pollEvents();
         source.waitSync();
+
+        // Adopt the device field of whatever map Python announced (no-op until
+        // it does); the camera threads then derive the matching crop and the
+        // geometry below drives the shader with the same span.
+        pollAnnouncedDeviceField(phospheneBridge);
+        const OverlayGeometry geom = overlayGeometryFor(gBlindnessMode);
 
         // Per-eye gaze in tangent space (keeps last-known values while invalid).
         const GazeTan gaze = source.getGaze();

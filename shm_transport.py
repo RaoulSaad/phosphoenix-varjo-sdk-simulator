@@ -368,6 +368,59 @@ class ShmBridge:
         fx = intr[0]
         return cfg["crop_w"] / (2.0 * fx)
 
+    # -- device-field negotiation (Python -> C++) ---------------------------
+    # C++ compiles a default kDeviceFieldTan, but the authoritative span is
+    # whatever phosphene map Python actually loaded. announce_device_field()
+    # bit-casts that tangent into the phos header's reserved word; C++ polls it
+    # every frame (pollAnnouncedDeviceField) and adapts its camera crop and
+    # shader. wait_for_crop_match() then confirms the round trip by watching
+    # the cam header until the crop sizes match the announced field.
+
+    _FIELD_TAN_OFFSET = 20   # ShmHeader.reserved0 (after magic/version/flags/configSeq/mode)
+
+    def announce_device_field(self, field_tan):
+        """Advertise the half-field tangent of the loaded phosphene map."""
+        struct.pack_into("<f", self.phos_mm, self._FIELD_TAN_OFFSET, float(field_tan))
+
+    def expected_crop(self, eye, field_tan):
+        """Crop size C++ should ask for once it adopts field_tan (its
+        computePythonCropSize: round(2*fx*tan), min 32, bumped to even)."""
+        cfg = self.configs[eye]
+        intr = intrinsics_pixels(cfg)
+        if intr is None:
+            return None
+        w = max(32, int(round(2.0 * intr[0] * field_tan)))
+        h = max(32, int(round(2.0 * intr[1] * field_tan)))
+        return (w + (w & 1), h + (h & 1))
+
+    def wait_for_crop_match(self, field_tan, timeout=5.0, verbose=True):
+        """Block until C++'s crop sizes reflect the announced field (or timeout).
+        Call before sizing any buffers from configs, so they use the final crop."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            self.refresh_config()
+            ok = True
+            for eye in range(NUM_EYES):
+                expected = self.expected_crop(eye, field_tan)
+                if expected is None:
+                    ok = False
+                    break
+                cfg = self.configs[eye]
+                if (abs(cfg["crop_w"] - expected[0]) > 2 or
+                        abs(cfg["crop_h"] - expected[1]) > 2):
+                    ok = False
+                    break
+            if ok:
+                if verbose:
+                    print(f"[SHM] C++ adopted device field tan={field_tan:.4f}: "
+                          f"crop {self.configs[0]['crop_w']}x{self.configs[0]['crop_h']}")
+                return True
+            time.sleep(0.02)
+        print(f"[SHM] WARNING: C++ did not adopt device field tan={field_tan:.4f} "
+              f"within {timeout:.0f}s (old C++ build?); continuing with crop "
+              f"{self.configs[0]['crop_w']}x{self.configs[0]['crop_h']} — geometry may be off")
+        return False
+
     # -- phosphenes (Python -> C++) ----------------------------------------
     def publish_phosphene(self, eye, frame_id, gray, flip_vertical=True):
         """Publish a 2-D uint8 phosphene image for `eye`.

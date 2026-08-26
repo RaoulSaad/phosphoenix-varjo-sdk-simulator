@@ -6,6 +6,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -32,15 +33,21 @@ extern BlindnessMode gBlindnessMode;
 // of the simulator producing that image AND the angular extent of that
 // simulator's phosphene coordinate map -- all three, or the world arrives at
 // the wrong scale (a crop wider than the array looks zoomed out).
-//   run_varjo.py -> config_viseon/simulator_config.yaml : view_angle 16
-//     DefaultCoordinateMap_1000_phosphenes spans +/-7.97 deg (measured), so the
-//     device field is 16 deg and this is tan(8 deg).
+//   run_varjo.py -> config_viseon/simulator_config.yaml : view_angle 48
+//     for the +/-24 deg maps (generate_lgn_map.py output, or the viseon map
+//     with --phosphene-map-scale 3). For the unscaled viseon map (+/-7.97 deg)
+//     use 0.1405f (tan 8) + view_angle 16 instead.
 //   PhospheneHandler_intrinsics.py -> params.yaml + grid_coords_full_field.yaml
-//     is a different, +/-24 deg array; that handler needs 0.45f and
-//     view_angle 48 instead. generate_device_coords.py's DEVICE_HALF_FOV_DEG
-//     belongs to that one too.
+//     (+/-24 deg array) also matches this value.
 // run_varjo.py re-derives this from the crop size and warns on mismatch.
-constexpr float kDeviceFieldTan = 0.1405f;   // tan(8 deg) -> +/-8 deg device field
+constexpr float kDeviceFieldTan = 0.4452f;   // tan(24 deg) -> +/-24 deg device field
+
+// Runtime device field, initialised to kDeviceFieldTan. Python derives the
+// real span from the phosphene map it loaded and announces it through the
+// phos SHM header (see pollAnnouncedDeviceField in transport.h); once adopted,
+// the camera crop and the shader both follow it — no rebuild needed when the
+// map changes. Atomic: written by the render loop, read by camera threads.
+extern std::atomic<float> gDeviceFieldTan;
 
 struct OverlayGeometry {
     float spotRadiusTan;        // scotoma (macular) / clear tunnel (glaucoma) boundary
