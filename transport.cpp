@@ -28,6 +28,7 @@
 #include <cstring>
 #include <vector>
 
+#include "phase_timers.h"
 #include "transport.h"
 
 static const char* kCamMapName  = "Local\\VarjoPhospheneCam";   // C++  -> Python
@@ -352,6 +353,10 @@ void publishCameraFrame(PhospheneBridge& bridge, const CameraFrame& frame, int e
     }
     bridge.lastSendTime[eye] = now;
 
+    // Timed from here (crop sizing + header config + the slot memcpy count as
+    // publish work); only added when a frame is actually published below.
+    const auto pubStart = std::chrono::steady_clock::now();
+
     bridge.frameWidth[eye] = frame.width;
     bridge.frameHeight[eye] = frame.height;
     bridge.rowStride[eye] = frame.rowStride;
@@ -394,6 +399,9 @@ void publishCameraFrame(PhospheneBridge& bridge, const CameraFrame& frame, int e
     shmPublish(channel, CAM_SLOT_STRIDE, CAM_SLOT_CAP,
                bridge.camWriteIndex[eye], meta,
                frame.nv12.data(), (uint32_t)frame.nv12.size());
+
+    gPhaseTimers.add(TIMER_SHM_PUB, std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - pubStart).count());
 }
 
 bool pollAnnouncedDeviceField(PhospheneBridge& bridge)
@@ -428,6 +436,10 @@ bool consumePhosphene(PhospheneBridge& bridge, int eye,
     // The GL texture upload is the renderer's job (uploadPhosphene).
     if (!bridge.phosBase) return false;
 
+    // Timed on success only: empty polls are a couple of header reads and
+    // would drown the copy cost in near-zero samples.
+    const auto conStart = std::chrono::steady_clock::now();
+
     ShmSlotMeta meta{};
     uint8_t* channel = shmChannel(bridge.phosBase, eye, PHOS_CHANNEL_SIZE);
     if (!shmConsume(channel, PHOS_SLOT_STRIDE, bridge.phosLastSeq[eye], meta, outGray)) {
@@ -438,5 +450,7 @@ bool consumePhosphene(PhospheneBridge& bridge, int eye,
 
     outWidth  = (int)meta.width;
     outHeight = (int)meta.height;
+    gPhaseTimers.add(TIMER_SHM_CON, std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - conStart).count());
     return true;
 }

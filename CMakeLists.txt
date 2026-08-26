@@ -41,8 +41,16 @@ add_custom_command(TARGET VarjoGazeDot POST_BUILD
         "$<TARGET_FILE_DIR:VarjoGazeDot>/VarjoLib.dll"
 )
 
-find_package(OpenCV REQUIRED)
-
-add_executable(opencvTest opencvTest.cpp 
-    webcam_source.cpp)
-target_link_libraries(opencvTest PRIVATE ${OpenCV_LIBS})
+# Webcam test harness: only built when its source exists (it was removed at
+# some point) and OpenCV is available. The Varjo app itself never needs OpenCV,
+# so its absence must not block configuring.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/opencvTest.cpp")
+    find_package(OpenCV QUIET)
+    if(OpenCV_FOUND)
+        add_executable(opencvTest opencvTest.cpp
+            webcam_source.cpp)
+        target_link_libraries(opencvTest PRIVATE ${OpenCV_LIBS})
+    else()
+        message(STATUS "OpenCV not found; skipping opencvTest")
+    endif()
+endif()

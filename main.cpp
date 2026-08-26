@@ -24,9 +24,12 @@
 #define NOMINMAX
 #include <windows.h>   // GetAsyncKeyState (ESC to quit)
 
+#include <chrono>
 #include <cmath>    // lround (mask-opacity logging)
 #include <cstdio>
 #include <vector>
+
+#include "phase_timers.h"
 
 #include "pipeline_types.h"
 #include "transport.h"
@@ -110,6 +113,18 @@ int main()
     // Reused scratch for consumed phosphene bytes; the render thread is single.
     std::vector<uint8_t> phospheneGray;
 
+    auto lastTimerPrint = std::chrono::steady_clock::now();
+
+    // Stale-phosphene watchdog: if Python was delivering images and stops, the
+    // headset silently keeps showing the LAST frame — say so on the console
+    // instead of looking mysteriously frozen. Armed per eye only after the
+    // first successful consume (so it stays quiet until Python connects).
+    std::chrono::steady_clock::time_point lastPhosphene[NUM_EYES]{};
+    bool phospheneSeen[NUM_EYES] = {false, false};
+    bool phospheneStale[NUM_EYES] = {false, false};
+    auto lastStaleWarn = std::chrono::steady_clock::now();
+    constexpr double kStaleAfterSeconds = 3.0;
+
     while (true) {
         // Simple local exit condition for the sample program.
         if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) break;
@@ -147,17 +162,52 @@ int main()
             phospheneBridge.gazeTanY[e].store(gaze.y[e]);
         }
 
-        source.beginFrame();
-        const int sci = source.acquireSwapchainImage();
-        renderer.beginFrame(sci);
-
-        // Upload latest phosphene texture for each eye
+        // Consume the newest phosphene image per eye and upload it. Done
+        // before the frame block so the phases stay disjoint: the SHM copy
+        // reports itself (shm_con inside consumePhosphene), the GL upload
+        // counts toward "render". Upload only touches our own texture, so it
+        // is safe outside the begin/submit bracket.
+        long long renderNs = 0;
         for (int e = 0; e < NUM_EYES; ++e) {
             int w = 0, h = 0;
             if (consumePhosphene(phospheneBridge, e, phospheneGray, w, h)) {
+                const auto tUpload = std::chrono::steady_clock::now();
                 renderer.uploadPhosphene(e, phospheneGray.data(), w, h);
+                renderNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - tUpload).count();
+
+                lastPhosphene[e] = tUpload;
+                phospheneSeen[e] = true;
+                if (phospheneStale[e]) {
+                    phospheneStale[e] = false;
+                    printf("[OK] eye %d: phosphene stream resumed\n", e);
+                }
             }
         }
+
+        // Watchdog check (rate-limited to one line per interval).
+        {
+            const auto tNow = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(tNow - lastStaleWarn).count() >= kStaleAfterSeconds) {
+                for (int e = 0; e < NUM_EYES; ++e) {
+                    if (!phospheneSeen[e]) continue;
+                    const double staleFor =
+                        std::chrono::duration<double>(tNow - lastPhosphene[e]).count();
+                    if (staleFor >= kStaleAfterSeconds) {
+                        phospheneStale[e] = true;
+                        printf("[WARN] eye %d: no new phosphenes for %.1f s -- "
+                               "Python side stalled or exited? (still showing the last image)\n",
+                               e, staleFor);
+                        lastStaleWarn = tNow;
+                    }
+                }
+            }
+        }
+
+        const auto tFrame = std::chrono::steady_clock::now();
+        source.beginFrame();
+        const int sci = source.acquireSwapchainImage();
+        renderer.beginFrame(sci);
 
         for (int i = 0; i < source.viewCount(); i++) {
             const int eyeIdx = source.viewIndexToEye(i);
@@ -174,6 +224,17 @@ int main()
         renderer.endFrame();
         source.releaseSwapchainImage();
         source.endFrameAndSubmit();
+
+        renderNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - tFrame).count();
+        gPhaseTimers.add(TIMER_RENDER, renderNs);
+
+        // Averaged phase latencies, once per second (mirrors Python's [TIME]).
+        const auto tNow = std::chrono::steady_clock::now();
+        if (tNow - lastTimerPrint >= std::chrono::seconds(1)) {
+            gPhaseTimers.printAndReset();
+            lastTimerPrint = tNow;
+        }
     }
 
     printf("Shutting down...\n");

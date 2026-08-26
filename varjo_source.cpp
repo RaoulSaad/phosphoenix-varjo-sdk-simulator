@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "phase_timers.h"
 #include "varjo_source.h"
 
 // ---------------------------------------------------------------------------
@@ -148,6 +149,10 @@ static void onEyeCameraFrame(
                 varjo_GetBufferCPUData(session, bufferId));
 
             if (src && meta.byteSize > 0) {
+                // Times the CPU copy out of Varjo's locked buffer (the
+                // "capture" cost we control; the camera->callback latency is
+                // Varjo's own and not visible here).
+                ScopedPhaseTimer timeCapture(TIMER_CAPTURE);
                 std::lock_guard<std::mutex> lock(capture->mutex);
                 // Publish a full CPU-owned copy for the saver/sender thread.
                 capture->latest.eye = capture->eye;
