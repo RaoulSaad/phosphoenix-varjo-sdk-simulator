@@ -1,6 +1,6 @@
 @echo off
 setlocal
-set "ENV_PY=%USERPROFILE%\.conda\envs\phos-rtcv\python.exe"
+set "ENV_PY=D:\software\conda\envs\phos-rtcv\python.exe"
 if not exist "%ENV_PY%" (
   echo Conda env phos-rtcv not found at %ENV_PY%
   echo Edit this file or set the python path in the launcher's Advanced section.

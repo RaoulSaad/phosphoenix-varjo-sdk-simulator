@@ -61,7 +61,11 @@ if(OpenCV_FOUND)
     # Release runtime DLLs next to the exe: opencv_world plus the separate
     # videoio backend DLLs the 5.x package ships. FFmpeg is what opens URLs
     # and video files; without it --webcam <url> fails to open.
-    get_target_property(_ocv_dll opencv_world IMPORTED_LOCATION_RELEASE)
+    if(TARGET opencv_world)
+        get_target_property(_ocv_dll opencv_world IMPORTED_LOCATION_RELEASE)
+    else()
+        get_target_property(_ocv_dll opencv_core IMPORTED_LOCATION_RELEASE)
+    endif()
     if(_ocv_dll)
         get_filename_component(_ocv_bin "${_ocv_dll}" DIRECTORY)
         file(GLOB _ocv_dlls "${_ocv_bin}/opencv_*.dll")

@@ -187,9 +187,23 @@ uniform int blindnessMode; // 0 = macular, 1 = glaucoma, 2 = full
 // real world underneath, for checking that phosphenes land on their objects.
 uniform float maskOpacity;
 
+
+// Tangent coordinates of a view direction, re-measured on a plane
+// perpendicular to the gaze (i.e. as the rotated eye sees it).
+vec2 gazeRelativeTan(vec2 tanPos, vec2 gazeTan)
+{
+    vec3 v = vec3(tanPos, 1.0);                     // pixel direction (x right, y up, z fwd)
+    vec3 f = normalize(vec3(gazeTan, 1.0));         // gaze direction
+    vec3 r = normalize(cross(vec3(0.0, 1.0, 0.0), f)); // eye's right, no roll
+    vec3 u = cross(f, r);                           // eye's up
+    vec3 l = vec3(dot(v, r), dot(v, u), dot(v, f));
+    if (l.z <= 1e-4) return vec2(1e6);              // behind the eye: treat as far away
+    return l.xy / l.z;
+}
+
 float blindnessMask(vec2 tanPos, vec2 gazeTan)
 {
-    float d = distance(tanPos, gazeTan);
+    float d = length(gazeRelativeTan(tanPos, gazeTan));
 
     // Macular degeneration:
     // black in the center, transparent outside
@@ -254,9 +268,22 @@ uniform float spotRadiusTan;
 uniform float softEdgeTan;
 uniform int blindnessMode; // 0 = macular, 1 = glaucoma, 2 = full
 
+// Tangent coordinates of a view direction, re-measured on a plane
+// perpendicular to the gaze (i.e. as the rotated eye sees it).
+vec2 gazeRelativeTan(vec2 tanPos, vec2 gazeTan)
+{
+    vec3 v = vec3(tanPos, 1.0);                     // pixel direction (x right, y up, z fwd)
+    vec3 f = normalize(vec3(gazeTan, 1.0));         // gaze direction
+    vec3 r = normalize(cross(vec3(0.0, 1.0, 0.0), f)); // eye's right, no roll
+    vec3 u = cross(f, r);                           // eye's up
+    vec3 l = vec3(dot(v, r), dot(v, u), dot(v, f));
+    if (l.z <= 1e-4) return vec2(1e6);              // behind the eye: treat as far away
+    return l.xy / l.z;
+}
+
 float blindnessMask(vec2 tanPos, vec2 gazeTan)
 {
-    float d = distance(tanPos, gazeTan);
+    float d = length(gazeRelativeTan(tanPos, gazeTan));
 
     // Macular degeneration:
     // phosphenes only in center blind spot
@@ -305,7 +332,7 @@ void main() {
     // phosphenes are always sampled relative to gaze and follow the eye. The
     // blindness mask above decides where they show: the central disc (macular),
     // the peripheral ring (glaucoma), or the whole device field (full blindness).
-    vec2 diff = tanPos - gazeTan;
+    vec2 diff = gazeRelativeTan(tanPos, gazeTan);
     float radius = phospheneRadiusTan;
 
     if (abs(diff.x) > radius || abs(diff.y) > radius) {
