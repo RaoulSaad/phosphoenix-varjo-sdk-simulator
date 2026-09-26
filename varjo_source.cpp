@@ -75,47 +75,14 @@ static int32_t getTotalHeight(const std::vector<varjo_Viewport>& vp) {
 // ---------------------------------------------------------------------------
 // Eye camera capture pipeline
 // ---------------------------------------------------------------------------
-
-static void cameraSaverThreadMain(EyeCameraCapture* capture)
-{
-    // Runs once per eye. It intentionally performs the transport publishing
-    // away from the Varjo DataStream callback so the callback can return
-    // quickly.
-
-    while (capture->running.load()) {
-        CameraFrame frame;
-        {
-            std::unique_lock<std::mutex> lock(capture->mutex);
-            // Sleep until the callback publishes a new CPU copy or shutdown is
-            // requested.
-            capture->cv.wait(lock, [&]() {
-                return !capture->running.load() || capture->hasNewFrame;
-            });
-            if (!capture->running.load()) break;
-            frame = capture->latest;
-            capture->hasNewFrame = false;
-        }
-
-        if (frame.nv12.empty() || frame.width <= 0 || frame.height <= 0) {
-            continue;
-        }
-
-        if (capture->onFrame) {
-            // The same latest camera frame is also the input to Python's
-            // phosphene generation pipeline.
-            capture->onFrame(frame, capture->eye);
-        }
-    }
-}
-
 static void onEyeCameraFrame(
     const varjo_StreamFrame* frame,
     varjo_Session* session,
     void* userData)
 {
-    // Varjo invokes this callback from its DataStream machinery whenever a
-    // distorted-color camera frame is available. Keep work here minimal: copy
-    // the frame, capture metadata/intrinsics, notify the worker thread.
+    // Varjo invokes this from its DataStream thread whenever a distorted-color
+    // frame is available. The one memcpy out of Varjo's locked buffer goes
+    // straight into the sink's slot.
     if (!frame || !userData) return;
     if (frame->type != varjo_StreamType_DistortedColor) return;
     if (!(frame->dataFlags & varjo_DataFlag_Buffer)) return;
@@ -123,64 +90,57 @@ static void onEyeCameraFrame(
     EyeCameraCaptureSet* set = reinterpret_cast<EyeCameraCaptureSet*>(userData);
 
     for (int eye = 0; eye < NUM_EYES; ++eye) {
-        // One callback can contain both left and right channels. Fan the frame
-        // out to whichever per-eye captures are active.
         EyeCameraCapture* capture = set->captures[eye];
-        if (!capture || !capture->running.load()) continue;
+        if (!capture || !capture->running.load() || !capture->sink) continue;
 
         const varjo_ChannelFlag wantFlag =
             (eye == 0) ? varjo_ChannelFlag_Left : varjo_ChannelFlag_Right;
         const varjo_ChannelIndex channel =
             (eye == 0) ? varjo_ChannelIndex_Left : varjo_ChannelIndex_Right;
-
         if (!(frame->channels & wantFlag)) continue;
 
         const varjo_BufferId bufferId =
             varjo_GetBufferId(session, frame->id, frame->frameNumber, channel);
         if (bufferId == varjo_InvalidId) continue;
 
-        // Lock while reading Varjo's buffer. The data pointer is only valid for
-        // the locked interval, so copy it before unlocking.
         varjo_LockDataStreamBuffer(session, bufferId);
         varjo_BufferMetadata meta = varjo_GetBufferMetadata(session, bufferId);
 
         if (meta.type == varjo_BufferType_CPU && meta.format == varjo_TextureFormat_NV12) {
             const uint8_t* src = reinterpret_cast<const uint8_t*>(
                 varjo_GetBufferCPUData(session, bufferId));
-
             if (src && meta.byteSize > 0) {
-                // Times the CPU copy out of Varjo's locked buffer (the
-                // "capture" cost we control; the camera->callback latency is
-                // Varjo's own and not visible here).
                 ScopedPhaseTimer timeCapture(TIMER_CAPTURE);
-                std::lock_guard<std::mutex> lock(capture->mutex);
-                // Publish a full CPU-owned copy for the saver/sender thread.
-                capture->latest.eye = capture->eye;
-                capture->latest.width = meta.width;
-                capture->latest.height = meta.height;
-                capture->latest.rowStride = meta.rowStride;
-                capture->latest.frameNumber = frame->frameNumber;
-                capture->latest.nv12.resize((size_t)meta.byteSize);
-                std::memcpy(capture->latest.nv12.data(), src, (size_t)meta.byteSize);
-                capture->latest.hasIntrinsics = false;
-                if (frame->dataFlags & varjo_DataFlag_Intrinsics) {
-                    // Intrinsics let Python convert gaze tangent radius to exact
-                    // crop pixels instead of using the fallback FOV estimate.
-                    varjo_CameraIntrinsics2 intr = varjo_GetCameraIntrinsics2(session, frame->id, frame->frameNumber, channel);
-                    capture->latest.hasIntrinsics = true;
-                    capture->latest.intrinsicsModel = (int)intr.model;
-                    capture->latest.focalLengthX = intr.focalLengthX;
-                    capture->latest.focalLengthY = intr.focalLengthY;
-                    capture->latest.principalPointX = intr.principalPointX;
-                    capture->latest.principalPointY = intr.principalPointY;
-                    for (int i = 0; i < 8; ++i) capture->latest.distortionCoefficients[i] = intr.distortionCoefficients[i];
+                uint32_t capacity = 0;
+                uint8_t* dst = capture->sink->beginFrame(capture->eye, &capacity);
+                if (dst && (uint32_t)meta.byteSize <= capacity) {
+                    std::memcpy(dst, src, (size_t)meta.byteSize);
+
+                    CameraFrame cf;
+                    cf.eye = capture->eye;
+                    cf.width = meta.width;
+                    cf.height = meta.height;
+                    cf.rowStride = meta.rowStride;
+                    cf.frameNumber = frame->frameNumber;
+                    cf.hasIntrinsics = false;
+                    if (frame->dataFlags & varjo_DataFlag_Intrinsics) {
+                        varjo_CameraIntrinsics2 intr = varjo_GetCameraIntrinsics2(session, frame->id, frame->frameNumber, channel);
+                        cf.hasIntrinsics = true;
+                        cf.intrinsicsModel = (int)intr.model;
+                        cf.focalLengthX = intr.focalLengthX;
+                        cf.focalLengthY = intr.focalLengthY;
+                        cf.principalPointX = intr.principalPointX;
+                        cf.principalPointY = intr.principalPointY;
+                        for (int i = 0; i < 8; ++i) cf.distortionCoefficients[i] = intr.distortionCoefficients[i];
+                    }
+                    capture->sink->commitFrame(capture->eye, cf, (uint32_t)meta.byteSize);
+                } else if (dst) {
+                    static bool warned = false;
+                    if (!warned) { warned = true; fprintf(stderr, "[CAM] frame %d bytes exceeds slot capacity %u; dropping\n", (int)meta.byteSize, capacity); }
                 }
-                capture->hasNewFrame = true;
             }
         }
-
         varjo_UnlockDataStreamBuffer(session, bufferId);
-        capture->cv.notify_one();
     }
 }
 
@@ -234,14 +194,11 @@ static bool startEyeCameraCaptures(
 
     // Both eye captures share the chosen stream metadata.
     for (EyeCameraCapture* cap : {&leftCapture, &rightCapture}) {
-        // Start worker threads before starting the stream so the first callback
-        // can immediately hand off frames.
         cap->streamId = best->streamId;
         cap->streamWidth = best->width;
         cap->streamHeight = best->height;
         cap->streamRowStride = best->rowStride;
         cap->running.store(true);
-        cap->saverThread = std::thread(cameraSaverThreadMain, cap);
     }
 
     set.captures[0] = &leftCapture;
@@ -262,8 +219,6 @@ static bool startEyeCameraCaptures(
         fprintf(stderr, "[CAM] StartDataStream failed: %s\n", varjo_GetErrorDesc(e));
         for (EyeCameraCapture* cap : {&leftCapture, &rightCapture}) {
             cap->running.store(false);
-            cap->cv.notify_all();
-            if (cap->saverThread.joinable()) cap->saverThread.join();
             cap->streamId = varjo_InvalidId;
         }
         set.captures[0] = nullptr;
@@ -293,10 +248,6 @@ static void stopEyeCameraCaptures(
     for (EyeCameraCapture* cap : {&leftCapture, &rightCapture}) {
         cap->streamId = varjo_InvalidId;
         cap->running.store(false);
-        cap->cv.notify_all();
-        if (cap->saverThread.joinable()) {
-            cap->saverThread.join();
-        }
     }
 }
 
@@ -340,7 +291,7 @@ bool VarjoFrameSource::initSession()
     return true;
 }
 
-bool VarjoFrameSource::createSwapchain()
+bool VarjoFrameSource::create()
 {
     m_viewCount = varjo_GetViewCount(m_session);
     printf("[OK] viewCount=%d\n", m_viewCount);
@@ -403,6 +354,11 @@ bool VarjoFrameSource::createSwapchain()
     return true;
 }
 
+bool VarjoFrameSource::shouldQuit() const
+{
+    return (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+}
+
 void VarjoFrameSource::shutdown()
 {
     if (!m_session) return;
@@ -419,11 +375,11 @@ void VarjoFrameSource::shutdown()
 // VarjoFrameSource — IFrameSource (capture)
 // ---------------------------------------------------------------------------
 
-bool VarjoFrameSource::start(FrameCallback onFrame)
+bool VarjoFrameSource::start(IFrameSink* sink)
 {
     for (int e = 0; e < NUM_EYES; ++e) {
         m_captures[e].eye = e;
-        m_captures[e].onFrame = onFrame;
+        m_captures[e].sink = sink;
     }
     return startEyeCameraCaptures(
         m_session, m_captures[0], m_captures[1], m_captureSet, m_cameraStreamId);

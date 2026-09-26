@@ -17,6 +17,7 @@
 //              beginFrame..endFrameAndSubmit. waitSync is deliberately NOT
 //              included: it is the compositor's frame pacing, and would
 //              drown the actual work in sleep time.
+//   e2e      - camera capture timestamp to phosphene texture upload, both eyes.
 ////////////////////////////////////////////////////////////////////////////////
 #pragma once
 
@@ -29,6 +30,7 @@ enum TimerPhase : int {
     TIMER_SHM_PUB,
     TIMER_SHM_CON,
     TIMER_RENDER,
+    TIMER_E2E,
     TIMER_PHASE_COUNT
 };
 
@@ -42,7 +44,7 @@ public:
     // Render loop, once per second. Skips phases with no samples.
     void printAndReset() {
         static const char* kNames[TIMER_PHASE_COUNT] = {
-            "capture", "shm_pub", "shm_con", "render"};
+            "capture", "shm_pub", "shm_con", "render", "e2e"};
         char line[256];
         int off = snprintf(line, sizeof(line), "[TIME]");
         bool any = false;

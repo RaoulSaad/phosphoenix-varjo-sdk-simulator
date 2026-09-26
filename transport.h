@@ -1,41 +1,64 @@
 ////////////////////////////////////////////////////////////////////////////////
-// transport.h — shared-memory bridge to Python (the pipeline seam).
+// transport.h — shared-memory bridge to Python, built on phx_shm.
 //
-// Two named, pagefile-backed sections, one per direction:
-//   cam  (C++ -> Python) : raw NV12 camera frames + per-frame gaze/metadata
-//   phos (Python -> C++) : 8-bit grayscale phosphene images
+//   phx_cam  (C++ producer -> Python consumer): NV12 camera frames + gaze,
+//            with the per-eye config (crop, intrinsics, blindness mode) in
+//            the section's config block.
+//   phx_phos (Python producer -> C++ consumer): 8-bit phosphene images, with
+//            Python's device-field announcement in the section's field block.
 //
-// The SHM wire layout (headers, control blocks, slots) is an implementation
-// detail of transport.cpp; this header only exposes the bridge state and the
-// operations the rest of the program needs. No Varjo, GL or Windows headers.
+// The bridge is the IFrameSink the camera source writes into.
 ////////////////////////////////////////////////////////////////////////////////
 #pragma once
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
+#include "frame_source.h"
 #include "pipeline_types.h"
 
-struct PhospheneBridge {
-    // Owns the two shared-memory sections and the state shared between:
-    //   - camera saver/sender threads (produce into the cam section),
-    //   - the render loop (consumes the phos section, writes gaze).
+struct phx_handle;
+
+#pragma pack(push, 1)
+struct ShmEyeConfig {
+    int32_t cropWidth;
+    int32_t cropHeight;
+    int32_t frameWidth;
+    int32_t frameHeight;
+    int32_t rowStride;
+    int32_t intrinsicsModel;
+    int32_t intrinsicsValid;
+    int32_t reserved;
+    double  focalLengthX;
+    double  focalLengthY;
+    double  principalPointX;
+    double  principalPointY;
+    double  distortionCoefficients[8];
+};
+// Must match phx_shm.py CAM_CONFIG_FMT ("<ifi" + "8i12d" * 2), 268 bytes.
+struct CamConfigBlob {
+    int32_t       blindnessMode;
+    float         yoloConf;       // live YOLO confidence threshold (negative = not set)
+    int32_t       mapRequest;     // "next phosphene map" press counter; Python acts on changes
+    ShmEyeConfig  eye[NUM_EYES];
+};
+#pragma pack(pop)
+static_assert(sizeof(ShmEyeConfig) == 128, "ShmEyeConfig must be 128 bytes");
+static_assert(sizeof(CamConfigBlob) == 268, "CamConfigBlob must be 268 bytes");
+
+struct PhospheneBridge : public IFrameSink {
     std::atomic<bool> running{false};
 
-    void* camMap  = nullptr;   // HANDLE, C++ -> Python (producer)
-    void* phosMap = nullptr;   // HANDLE, Python -> C++ (consumer)
-    uint8_t* camBase  = nullptr;
-    uint8_t* phosBase = nullptr;
+    phx_handle* cam  = nullptr;   // producer, created by startPhospheneBridge
+    phx_handle* phos = nullptr;   // consumer, opened lazily by pollPhosOpen
 
-    // Per-eye publish/consume cursors (process-local, not shared).
-    uint32_t camWriteIndex[NUM_EYES] = {0, 0};   // producer's next cam slot
-    uint32_t phosLastSeq[NUM_EYES]   = {0, 0};   // last phos publishSeq we consumed
+    uint64_t phosLastSeq[NUM_EYES] = {0, 0};
+    uint64_t fieldSeq = 0;        // last device-field announcement adopted
 
-    // Gaze values are atomics because the render loop writes them while the
-    // camera sender threads read them to annotate outgoing frames.
-    std::atomic<float> gazeTanX[NUM_EYES];   // [0]=L, [1]=R
+    // Written by the render loop, read by the capture thread when stamping frames.
+    std::atomic<float> gazeTanX[NUM_EYES];
     std::atomic<float> gazeTanY[NUM_EYES];
 
     int cropWidth[NUM_EYES]    = {0, 0};
@@ -44,20 +67,22 @@ struct PhospheneBridge {
     int frameHeight[NUM_EYES]  = {0, 0};
     int rowStride[NUM_EYES]    = {0, 0};
 
-    std::chrono::steady_clock::time_point lastSendTime[NUM_EYES];
+    // Last config written to the cam section, for change detection.
+    std::mutex     configMutex;
+    CamConfigBlob  lastConfig{};
+    bool           configWritten = false;
 
     PhospheneBridge() {
-        for (int e = 0; e < NUM_EYES; ++e) {
-            gazeTanX[e].store(0.0f);
-            gazeTanY[e].store(0.0f);
-            lastSendTime[e] = std::chrono::steady_clock::now() - std::chrono::seconds(1);
-        }
+        for (int e = 0; e < NUM_EYES; ++e) { gazeTanX[e].store(0.0f); gazeTanY[e].store(0.0f); }
     }
+
+    // IFrameSink
+    uint8_t* beginFrame(int eye, uint32_t* capacity) override;
+    void     commitFrame(int eye, const CameraFrame& meta, uint32_t byteSize) override;
 };
 
 // Convert a tangent-space crop radius into camera pixels, preferring the
 // frame's intrinsics; falls back to an approximate camera FOV when absent.
-// Used by main's startup sizing (frame == nullptr) and per published frame.
 void computePythonCropSize(
     int frameWidth,
     int frameHeight,
@@ -66,26 +91,26 @@ void computePythonCropSize(
     int& outCropWidth,
     int& outCropHeight);
 
-// Create/map both sections, reset the per-eye control blocks, publish the
-// initial per-eye config (from the bridge's crop/frame sizes), set READY last.
-bool startPhospheneBridge(PhospheneBridge& bridge);
+// Create the cam section (2 channels, 3 slots, camPayloadBytes per slot) and
+// publish the initial config. Python creates phos; see pollPhosOpen.
+bool startPhospheneBridge(PhospheneBridge& bridge, uint32_t camPayloadBytes);
 
-// Signal SHUTDOWN to Python via both headers, then unmap/close the sections.
+// Flag shutdown on cam, close both sections.
 void stopPhospheneBridge(PhospheneBridge& bridge);
 
-// Publish one camera frame (+ current gaze and config) to Python. Called from
-// the per-eye camera saver threads.
-void publishCameraFrame(PhospheneBridge& bridge, const CameraFrame& frame, int eye);
+// Try to open the phos section if Python has created it. Cheap when it is
+// not there yet; a no-op once open. Returns true when phos is open.
+bool pollPhosOpen(PhospheneBridge& bridge);
 
-// Consume the latest phosphene image for one eye if it is newer than the last
-// call (render thread only). Returns bytes + dimensions; no GL here — the
-// texture upload is the renderer's half of the old uploadLatestPhospheneTexture.
+// Copy the newest phosphene image for `eye` if newer than the last call
+// (render thread only). False if nothing new, torn, or phos not open.
 bool consumePhosphene(PhospheneBridge& bridge, int eye,
-                      std::vector<uint8_t>& outGray, int& outWidth, int& outHeight);
+                      std::vector<uint8_t>& outGray, int& outWidth, int& outHeight,
+                      uint64_t& outFrameNumber, uint64_t& outCaptureTs);
 
-// Python announces the half-field tangent of the phosphene map it loaded by
-// writing the float into the phos header's reserved word (0 = no announcement,
-// e.g. the old PhospheneHandler). Call once per frame from the render loop:
-// adopts the value into gDeviceFieldTan so the camera crop and the shader
-// follow the map automatically. Returns true when the value changed.
+// Adopt Python's announced device field into gDeviceFieldTan. Once per frame.
 bool pollAnnouncedDeviceField(PhospheneBridge& bridge);
+
+// Liveness. Call bridgeHeartbeat once per render frame.
+void bridgeHeartbeat(PhospheneBridge& bridge);
+bool pythonAlive(PhospheneBridge& bridge, double maxAgeSeconds);

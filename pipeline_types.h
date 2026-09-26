@@ -24,7 +24,40 @@ enum BlindnessMode {
 
 // Single source of truth for the active blindness type (defined in
 // pipeline_types.cpp). C++ owns it; Python follows it via the cam header.
-extern BlindnessMode gBlindnessMode;
+extern std::atomic<BlindnessMode> gBlindnessMode;
+
+constexpr int NUM_BLINDNESS_MODES = 3;
+
+// "macular" / "glaucoma" / "full" for logs.
+const char* blindnessModeName(BlindnessMode mode);
+
+// Runtime scotoma (macular) / clear-tunnel (glaucoma) radius per mode, as
+// tan(angle). Indexed by BlindnessMode; the full-blindness entry is unused
+// (the mask is black everywhere). Adjusted live from the keyboard to sweep
+// disease severity; only the mask shader reads it, so Python does not care.
+// Atomic for the same reason as gDeviceFieldTan (overlayGeometryFor runs on
+// the camera threads too).
+extern std::atomic<float> gSpotRadiusTan[NUM_BLINDNESS_MODES];
+constexpr float kSpotRadiusStepTan = 0.01f;
+constexpr float kSpotRadiusMinTan  = 0.0f;
+constexpr float kSpotRadiusMaxTan  = 0.6f;
+
+// Live YOLO confidence threshold. C++ owns the keyboard, so it owns this value
+// too and forwards it to Python through the cam header (CamConfigBlob); the
+// Python dispatch applies it per frame. Negative would mean "not set, Python
+// keeps its own --conf"; C++ always sends a real value.
+extern std::atomic<float> gYoloConf;
+constexpr float kYoloConfDefault = 0.25f;
+constexpr float kYoloConfStep    = 0.05f;
+constexpr float kYoloConfMin     = 0.05f;
+constexpr float kYoloConfMax     = 0.95f;
+
+// "Next phosphene map" request counter. Each key press bumps it; the transport
+// mirrors it into the cam header and Python swaps to the next map in its list
+// whenever the value changes (then re-announces the device field, which C++
+// adopts through the usual handshake). A counter rather than a flag so a press
+// can never be lost or double-counted across the config seqlock.
+extern std::atomic<int32_t> gMapRequest;
 
 // Fixed implant's phosphene half-field, as tan(half-FOV). This one constant
 // sets BOTH ends of the loop: computePythonCropSize() asks Python for a camera
@@ -61,8 +94,7 @@ OverlayGeometry overlayGeometryFor(BlindnessMode mode);
 // Camera frame + gaze + view geometry (source/renderer-agnostic)
 // ---------------------------------------------------------------------------
 
-// One CPU camera frame for a single eye, in NV12. Produced by an IFrameSource,
-// consumed by the transport.
+// One camera frame's metadata for a single eye. NV12 bytes are written in the sink's buffer.
 struct CameraFrame {
     int eye = 0;
     int width = 0;
@@ -76,7 +108,6 @@ struct CameraFrame {
     double principalPointX = 0.0;
     double principalPointY = 0.0;
     double distortionCoefficients[8] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-    std::vector<uint8_t> nv12;
 };
 
 // Per-eye gaze in tangent space (tan of the angle from view forward).

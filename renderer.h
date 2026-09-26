@@ -53,6 +53,22 @@ public:
     void setMaskOpacity(float opacity);
     float maskOpacity() const { return m_maskOpacity; }
 
+    // Phosphene layer brightness multiplier, 0..1. main drops it to 0 while
+    // Python is not alive so a stale image is not shown as if it were live.
+    void setPhospheneOpacity(float opacity);
+    float phospheneOpacity() const { return m_phospheneOpacity; }
+
+    // The hidden 1x1 Win32 window the GL context was created on, as an HWND.
+    // WindowDisplay resizes and shows it in webcam mode.
+    void* nativeWindow() const;
+
+    // Passthrough stand-in for windowed mode: the latest camera frame drawn
+    // as an opaque background before the overlay passes. NV12 in, converted
+    // in the shader. Unused on the headset (Varjo composites the cameras).
+    void initPassthroughTextures(int width, int height);
+    void uploadPassthrough(const uint8_t* nv12, int width, int height, int rowStride);
+    void drawPassthrough(const Viewport& vp);
+
     // Delete GL objects (programs, VAO, textures, FBOs). Call before the Varjo
     // swapchain/session are freed; the context stays alive for that.
     void shutdownGL();
@@ -78,6 +94,16 @@ private:
 
     // Debug/alignment aid; 1.0 is the normal simulation.
     float m_maskOpacity = 1.0f;
+    float m_phospheneOpacity = 1.0f;
+
+
+    bool m_defaultFramebuffer = false;   // draw to FBO 0 (window) instead of swapchain FBOs
+
+    unsigned int m_passthroughProgram = 0;
+    unsigned int m_passthroughTexY  = 0;   // GL_R8, full res
+    unsigned int m_passthroughTexUV = 0;   // GL_RG8, half res
+    int m_passthroughWidth = 0, m_passthroughHeight = 0;
+    int m_locPtTexY = -1, m_locPtTexUV = -1;
 
     // Uniform locations — black spot program.
     int m_locGazeTanX = -1, m_locGazeTanY = -1;

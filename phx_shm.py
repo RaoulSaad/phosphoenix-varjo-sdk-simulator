@@ -38,7 +38,8 @@ def _find_library(path=None):
              os.path.join(_HERE, _LIB_NAME),
              os.path.join(_HERE, "build-phx", "Release", _LIB_NAME),
              os.path.join(_HERE, "build", "Release", _LIB_NAME),
-             os.path.join(_HERE, "build-phx", _LIB_NAME)]
+             os.path.join(_HERE, "build-phx", _LIB_NAME),
+             os.path.join(_HERE, "build", "phx_shm", "Release", _LIB_NAME)]
     for c in cands:
         if c and os.path.exists(c):
             return c
@@ -244,12 +245,14 @@ CAM_NAME, PHOS_NAME = "phx_cam", "phx_phos"
 BLINDNESS_MACULAR, BLINDNESS_GLAUCOMA, BLINDNESS_FULL = 0, 1, 2
 BLINDNESS_NAMES = {BLINDNESS_MACULAR: "macular", BLINDNESS_GLAUCOMA: "glaucoma", BLINDNESS_FULL: "full"}
 _EYE_FMT = "<8i12d"
-CAM_CONFIG_FMT = "<ii" + _EYE_FMT[1:] * NUM_EYES
+# int blindness_mode, float yolo_conf (-1 = C++ has not set one), int map_request
+# (counter: C++ bumps it once per "next map" key press), then per-eye blocks.
+CAM_CONFIG_FMT = "<ifi" + _EYE_FMT[1:] * NUM_EYES
 CAM_CONFIG_SIZE = struct.calcsize(CAM_CONFIG_FMT)
 
 
-def pack_cam_config(blindness_mode, eyes):
-    vals = [int(blindness_mode), 0]
+def pack_cam_config(blindness_mode, eyes, yolo_conf=-1.0, map_request=0):
+    vals = [int(blindness_mode), float(yolo_conf), int(map_request)]
     for e in eyes:
         vals += [e["crop_w"], e["crop_h"], e["frame_w"], e["frame_h"], e["row_stride"],
                  e["intr_model"], 1 if e["intr_valid"] else 0, 0,
@@ -259,15 +262,15 @@ def pack_cam_config(blindness_mode, eyes):
 
 def unpack_cam_config(blob):
     v = struct.unpack(CAM_CONFIG_FMT, blob[:CAM_CONFIG_SIZE])
-    mode = v[0]
+    mode, yolo_conf, map_request = v[0], v[1], v[2]
     eyes = []
     for e in range(NUM_EYES):
-        b = 2 + e * 20
+        b = 3 + e * 20
         eyes.append({"crop_w": v[b], "crop_h": v[b + 1], "frame_w": v[b + 2], "frame_h": v[b + 3],
                      "row_stride": v[b + 4], "intr_model": v[b + 5], "intr_valid": bool(v[b + 6]),
                      "focal_x": v[b + 8], "focal_y": v[b + 9], "pp_x": v[b + 10], "pp_y": v[b + 11],
                      "coeffs": list(v[b + 12:b + 20])})
-    return mode, eyes
+    return mode, yolo_conf, map_request, eyes
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +284,8 @@ class ShmBridge:
         self.phos = None
         self.configs = [None, None]
         self.blindness_mode = BLINDNESS_MACULAR
+        self.yolo_conf = -1.0   # live YOLO confidence from C++; negative = keep --conf
+        self.map_request = 0    # C++ "next map" press counter; act on changes
         self.config_seq = 0
         self._cam_last_seq = [0, 0]
         self._undistort_cache = [None, None]
@@ -346,7 +351,7 @@ class ShmBridge:
         blob, seq = r
         if seq == self.config_seq:
             return False
-        self.blindness_mode, self.configs = unpack_cam_config(blob)
+        self.blindness_mode, self.yolo_conf, self.map_request, self.configs = unpack_cam_config(blob)
         self.config_seq = seq
         return True
 
@@ -369,6 +374,13 @@ class ShmBridge:
             f.release()
             return None
         return f
+
+    def wait_camera(self, eye, timeout_ms):
+        """Block until a camera frame newer than the last poll_camera() for
+        `eye` exists, the timeout passes, or C++ signals shutdown. Returns the
+        PHX_* status. Both eyes are published from one callback, so waiting on
+        eye 0 is enough for the capture loop."""
+        return self.cam.wait(eye, self._cam_last_seq[eye], timeout_ms)
 
     @staticmethod
     def to_bgr(frame):

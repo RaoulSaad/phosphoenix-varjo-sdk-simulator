@@ -17,8 +17,10 @@
 #include "glext.h"
 #include "wglext.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 #include "renderer.h"
 
@@ -320,6 +322,23 @@ void main() {
 }
 )";
 
+static const char* g_passthroughFragSrc = R"(
+#version 330 core
+in vec2 vUV;
+out vec4 fragColor;
+uniform sampler2D texY;
+uniform sampler2D texUV;
+void main() {
+    // BT.601 limited range NV12 -> RGB; matches cv::COLOR_YUV2BGR_NV12.
+    float y = (texture(texY, vUV).r - 16.0 / 255.0) * 1.164;
+    vec2 uv = texture(texUV, vUV).rg - 0.5;
+    float r = y + 1.596 * uv.y;
+    float g = y - 0.391 * uv.x - 0.813 * uv.y;
+    float b = y + 2.018 * uv.x;
+    fragColor = vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0);
+}
+)";
+
 // ---------------------------------------------------------------------------
 // Shader helpers
 // ---------------------------------------------------------------------------
@@ -373,8 +392,17 @@ bool OverlayRenderer::initGL()
 bool OverlayRenderer::setupSwapchainFbos(const std::vector<unsigned int>& swapchainTextures,
                                          int atlasWidth, int atlasHeight)
 {
+    
     m_atlasWidth  = atlasWidth;
     m_atlasHeight = atlasHeight;
+    if (swapchainTextures.empty()) {
+        // Windowed mode: the display draws straight into the default framebuffer.
+        m_defaultFramebuffer = true;
+        m_fbos.clear();
+        printf("[OK] default framebuffer %dx%d\n", atlasWidth, atlasHeight);
+        return true;
+    }
+    m_defaultFramebuffer = false;
 
     m_fbos.resize(swapchainTextures.size());
     glGenFramebuffers((GLsizei)m_fbos.size(), m_fbos.data());
@@ -422,6 +450,14 @@ bool OverlayRenderer::initShaders()
     m_locPSoftEdgeTan     = glGetUniformLocation(m_phospheneProgram, "softEdgeTan");
     m_locPBlindnessMode   = glGetUniformLocation(m_phospheneProgram, "blindnessMode");
 
+    m_passthroughProgram = createProgram(g_passthroughFragSrc);
+    m_locPtTexY  = glGetUniformLocation(m_passthroughProgram, "texY");
+    m_locPtTexUV = glGetUniformLocation(m_passthroughProgram, "texUV");
+    glUseProgram(m_passthroughProgram);
+    glUniform1i(m_locPtTexY, 0);
+    glUniform1i(m_locPtTexUV, 1);
+    glUseProgram(0);
+
     printf("[OK] Shaders\n");
 
     // The phosphene sampler always reads texture unit 0.
@@ -444,6 +480,9 @@ void OverlayRenderer::initPhospheneTextures(const int cropWidth[NUM_EYES], const
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        // Upload zeros: glTexImage2D with a null pointer leaves whatever was
+        // in that VRAM before, which the shader would happily draw as phosphenes.
+        std::vector<uint8_t> zeros((size_t)cropWidth[e] * (size_t)cropHeight[e], 0);
         glTexImage2D(
             GL_TEXTURE_2D,
             0,
@@ -453,7 +492,7 @@ void OverlayRenderer::initPhospheneTextures(const int cropWidth[NUM_EYES], const
             0,
             GL_RED,
             GL_UNSIGNED_BYTE,
-            nullptr);
+            zeros.data());
         m_texWidth[e]  = cropWidth[e];
         m_texHeight[e] = cropHeight[e];
     }
@@ -493,12 +532,69 @@ void OverlayRenderer::uploadPhosphene(int eye, const uint8_t* data, int width, i
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+void OverlayRenderer::initPassthroughTextures(int width, int height)
+{
+    m_passthroughWidth = width; m_passthroughHeight = height;
+    GLuint tex[2]; glGenTextures(2, tex);
+    m_passthroughTexY = tex[0]; m_passthroughTexUV = tex[1];
+    for (int i = 0; i < 2; ++i) {
+        glBindTexture(GL_TEXTURE_2D, tex[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(GL_TEXTURE_2D, m_passthroughTexY);
+    std::vector<uint8_t> zeros((size_t)width * (size_t)height, 0);   // black frame until the first upload
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, zeros.data());
+    glBindTexture(GL_TEXTURE_2D, m_passthroughTexUV);
+    std::fill(zeros.begin(), zeros.end(), (uint8_t)128);                 // neutral chroma
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, width / 2, height / 2, 0, GL_RG, GL_UNSIGNED_BYTE, zeros.data());
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+void OverlayRenderer::uploadPassthrough(const uint8_t* nv12, int width, int height, int rowStride)
+{
+    if (!m_passthroughTexY || width != m_passthroughWidth || height != m_passthroughHeight) return;
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, rowStride);
+    glBindTexture(GL_TEXTURE_2D, m_passthroughTexY);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, nv12);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, rowStride / 2);   // RG8 texels: stride in texels is half
+    glBindTexture(GL_TEXTURE_2D, m_passthroughTexUV);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width / 2, height / 2, GL_RG, GL_UNSIGNED_BYTE,
+                    nv12 + (size_t)rowStride * (size_t)height);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+void OverlayRenderer::drawPassthrough(const Viewport& vp)
+{
+    if (!m_passthroughTexY) return;
+    glDisable(GL_BLEND);                       // opaque background
+    glUseProgram(m_passthroughProgram);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, m_passthroughTexY);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, m_passthroughTexUV);
+    glViewport(vp.x, vp.y, vp.width, vp.height);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
+    glEnable(GL_BLEND);                        // beginFrame's blend state for the overlay passes
+}
+
+
 void OverlayRenderer::beginFrame(int swapchainImageIndex)
 {
     // Render into the acquired Varjo swapchain image.
-    glBindFramebuffer(GL_FRAMEBUFFER, m_fbos[swapchainImageIndex]);
-    glViewport(0, 0, m_atlasWidth, m_atlasHeight);
-    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    if (m_defaultFramebuffer || swapchainImageIndex < 0) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, m_atlasWidth, m_atlasHeight);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);   // opaque: there is no compositor behind us
+    } else {
+        glBindFramebuffer(GL_FRAMEBUFFER, m_fbos[swapchainImageIndex]);
+        glViewport(0, 0, m_atlasWidth, m_atlasHeight);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    }
     glClear(GL_COLOR_BUFFER_BIT);
 
     glEnable(GL_BLEND);
@@ -545,7 +641,7 @@ void OverlayRenderer::drawView(const Viewport& vp, const ViewTangents& t,
     glUniform1f(m_locPViewTop,         t.top);
     glUniform1f(m_locPViewBottom,      t.bottom);
     glUniform1f(m_locPPhospheneRadius, geom.phospheneRadiusTan);
-    glUniform1f(m_locPPhospheneOp,     1.0f);
+    glUniform1f(m_locPPhospheneOp,     m_phospheneOpacity);
     glUniform1f(m_locPSpotRadiusTan,   geom.spotRadiusTan);
     glUniform1f(m_locPSoftEdgeTan,     geom.softEdgeTan);
     glUniform1i(m_locPBlindnessMode,   (int)mode);
@@ -568,6 +664,11 @@ void OverlayRenderer::setMaskOpacity(float opacity)
     m_maskOpacity = (opacity < 0.0f) ? 0.0f : (opacity > 1.0f ? 1.0f : opacity);
 }
 
+void OverlayRenderer::setPhospheneOpacity(float opacity)
+{
+    m_phospheneOpacity = (opacity < 0.0f) ? 0.0f : (opacity > 1.0f ? 1.0f : opacity);
+}
+
 void OverlayRenderer::shutdownGL()
 {
     glDeleteVertexArrays(1, &m_vao);
@@ -575,9 +676,14 @@ void OverlayRenderer::shutdownGL()
     glDeleteProgram(m_phospheneProgram);
     glDeleteTextures(NUM_EYES, m_phospheneTexture);
     if (!m_fbos.empty()) glDeleteFramebuffers((GLsizei)m_fbos.size(), m_fbos.data());
+    if (m_passthroughProgram) glDeleteProgram(m_passthroughProgram);
+    if (m_passthroughTexY) { GLuint t[2] = {m_passthroughTexY, m_passthroughTexUV}; glDeleteTextures(2, t); }
 }
 
 void OverlayRenderer::destroyContext()
 {
     destroyGLContext();
 }
+
+void* OverlayRenderer::nativeWindow() const { return (void*)g_hwnd; }
+

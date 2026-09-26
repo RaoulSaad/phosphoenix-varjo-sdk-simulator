@@ -14,29 +14,22 @@
 #include <Varjo_types_datastream.h>
 
 #include <atomic>
-#include <condition_variable>
-#include <mutex>
-#include <thread>
 #include <vector>
 
 #include "frame_source.h"
 #include "pipeline_types.h"
+#include "display.h"
 
 struct EyeCameraCapture {
-    // One capture state per eye. The Varjo callback writes "latest"; the saver
-    // thread waits on cv, copies the frame, and forwards it via onFrame.
-    std::mutex mutex;
-    std::condition_variable cv;
-    CameraFrame latest;
-    bool hasNewFrame = false;
+    // One capture state per eye. The Varjo callback writes straight into the
+    // sink's buffer; there is no intermediate copy and no saver thread.
     std::atomic<bool> running{false};
-    std::thread saverThread;
     varjo_StreamId streamId = varjo_InvalidId;
     int streamWidth = 0;
     int streamHeight = 0;
     int streamRowStride = 0;
     int eye = 0;              // 0 = left, 1 = right
-    FrameCallback onFrame;    // delivers frames to the transport
+    IFrameSink* sink = nullptr;
 };
 
 // Wraps the 2-eye capture array so a single stream subscription can fan
@@ -46,38 +39,38 @@ struct EyeCameraCaptureSet {
     EyeCameraCapture* captures[NUM_EYES] = {nullptr, nullptr};
 };
 
-class VarjoFrameSource : public IFrameSource {
+class VarjoFrameSource : public IFrameSource, public IDisplay {
 public:
-    // --- lifecycle (sequence: renderer.initGL() -> initSession() -> start()
-    //     -> createSwapchain(); the GL context must exist before the swapchain).
+    // --- lifecycle
     bool initSession();       // session + MR video pass-through + gaze init
-    bool createSwapchain();   // viewports, GL swapchain, layer/submit structs
     void shutdown();          // MR off, frameInfo, swapchain, session
 
     // --- IFrameSource (the capture seam)
-    bool start(FrameCallback onFrame) override;
+    bool start(IFrameSink* sink) override;
     void stop() override;
     GazeTan getGaze() override;
     int frameWidth(int eye) const override  { return m_captures[eye].streamWidth; }
     int frameHeight(int eye) const override { return m_captures[eye].streamHeight; }
     int rowStride(int eye) const override   { return m_captures[eye].streamRowStride; }
 
-    // --- XR display (Varjo-only, not on the interface)
-    int viewCount() const { return m_viewCount; }
-    Viewport viewport(int viewIndex) const;
-    ViewTangents tangents(int viewIndex) const;   // this frame's FOV tangents
-    int viewIndexToEye(int viewIndex) const;
-    std::vector<unsigned int> swapchainTextures() const;   // GL handles for FBOs
-    int atlasWidth() const  { return m_atlasWidth; }
-    int atlasHeight() const { return m_atlasHeight; }
-
-    // --- frame loop primitives (called in this order each frame)
-    void pollEvents();               // MR device status prints
-    void waitSync();
-    void beginFrame();               // varjo_BeginFrameWithLayers + tangent snapshot
-    int  acquireSwapchainImage();
-    void releaseSwapchainImage();
-    void endFrameAndSubmit();        // fill per-view proj/view matrices, submit layer
+    // --- IDisplay
+    bool create() override;                 // viewports, GL swapchain, layer/submit structs
+    void destroy() override { shutdown(); }
+    int          viewCount() const override { return m_viewCount; }
+    Viewport     viewport(int viewIndex) const override;
+    ViewTangents tangents(int viewIndex) const override;
+    int          viewIndexToEye(int viewIndex) const override;
+    std::vector<unsigned int> swapchainTextures() const override;
+    int  atlasWidth() const override  { return m_atlasWidth; }
+    int  atlasHeight() const override { return m_atlasHeight; }
+    void pollEvents() override;
+    void waitSync() override;
+    void beginFrame() override;
+    int  acquireSwapchainImage() override;
+    void releaseSwapchainImage() override;
+    void endFrameAndSubmit() override;
+    bool wantsPassthroughPass() const override { return false; }
+    bool shouldQuit() const override;
 
 private:
     varjo_Session* m_session = nullptr;

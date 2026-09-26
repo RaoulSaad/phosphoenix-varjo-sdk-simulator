@@ -188,10 +188,39 @@ def test_python_producer_c_consumer():
 
 def test_bridge_config_blob_roundtrip():
     """ShmBridge's cam-config packing must match transport.cpp's CamConfigBlob."""
-    assert phx_shm.CAM_CONFIG_SIZE == 264
+    assert phx_shm.CAM_CONFIG_SIZE == 268
     eye = dict(crop_w=158, crop_h=158, frame_w=1152, frame_h=1152, row_stride=1152,
                intr_model=2, intr_valid=True, focal_x=560.0, focal_y=560.0,
                pp_x=580.0, pp_y=571.0, coeffs=[0.1, 0.2, 0, 0, 0, 0, 0, 0])
-    blob = phx_shm.pack_cam_config(1, [eye, eye])
-    mode, eyes = phx_shm.unpack_cam_config(blob)
+    blob = phx_shm.pack_cam_config(1, [eye, eye], yolo_conf=0.4, map_request=7)
+    mode, conf, map_request, eyes = phx_shm.unpack_cam_config(blob)
     assert mode == 1 and eyes[0] == eye and eyes[1] == eye
+    assert abs(conf - 0.4) < 1e-6
+    assert map_request == 7
+    # Defaults: -1 conf sentinel (Python keeps its own --conf), no map request.
+    _, conf, map_request, _ = phx_shm.unpack_cam_config(phx_shm.pack_cam_config(0, [eye, eye]))
+    assert conf < 0 and map_request == 0
+
+
+def test_bridge_wait_camera_uses_last_seen_seq():
+    """wait_camera must return immediately when a frame newer than the last
+    poll exists, and time out otherwise."""
+    name_cam = phx_shm.CAM_NAME
+    phx_shm.unlink(name_cam)
+    prod = phx_shm.Section.create(name_cam, channels=2, slots=3, payload_bytes=64)
+    prod.config_write(phx_shm.pack_cam_config(2, [dict(
+        crop_w=32, crop_h=32, frame_w=8, frame_h=4, row_stride=8, intr_model=2,
+        intr_valid=True, focal_x=4.0, focal_y=4.0, pp_x=4.0, pp_y=2.0, coeffs=[0] * 8)] * 2))
+    b = phx_shm.ShmBridge()
+    b.cam = phx_shm.Section.open(name_cam, timeout=1.0)
+    b.refresh_config()
+    assert b.wait_camera(0, 5) == phx_shm.PHX_TIMEOUT
+    v, _ = prod.publish_begin(0)
+    prod.publish_commit(0, {"byte_size": 48, "width": 8, "height": 4, "row_stride": 8, "eye": 0})
+    assert b.wait_camera(0, 5) == phx_shm.PHX_OK
+    f = b.poll_camera(0)
+    assert f is not None and f.release()
+    assert b.wait_camera(0, 5) == phx_shm.PHX_TIMEOUT      # nothing newer than what we took
+    b.cam.close()
+    prod.set_shutdown()
+    prod.close()
