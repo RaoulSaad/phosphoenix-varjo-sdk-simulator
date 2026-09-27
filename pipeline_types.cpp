@@ -23,7 +23,7 @@ std::atomic<float> gSpotRadiusTan[NUM_BLINDNESS_MODES] = {
 };
 
 std::atomic<float> gYoloConf{kYoloConfDefault};
-std::atomic<int32_t> gMapRequest{0};
+std::atomic<bool> gQuitRequested{false};
 
 const char* blindnessModeName(BlindnessMode mode)
 {

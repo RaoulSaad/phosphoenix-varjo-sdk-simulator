@@ -6,3 +6,5 @@ captures/
 clutter/
 build-phx/
 realtime_phosphene_pipeline/
+launcher/presets/last.json
+.superpowers/

@@ -245,14 +245,13 @@ CAM_NAME, PHOS_NAME = "phx_cam", "phx_phos"
 BLINDNESS_MACULAR, BLINDNESS_GLAUCOMA, BLINDNESS_FULL = 0, 1, 2
 BLINDNESS_NAMES = {BLINDNESS_MACULAR: "macular", BLINDNESS_GLAUCOMA: "glaucoma", BLINDNESS_FULL: "full"}
 _EYE_FMT = "<8i12d"
-# int blindness_mode, float yolo_conf (-1 = C++ has not set one), int map_request
-# (counter: C++ bumps it once per "next map" key press), then per-eye blocks.
-CAM_CONFIG_FMT = "<ifi" + _EYE_FMT[1:] * NUM_EYES
+# int blindness_mode, float yolo_conf (-1 = C++ has not set one), then per-eye blocks.
+CAM_CONFIG_FMT = "<if" + _EYE_FMT[1:] * NUM_EYES
 CAM_CONFIG_SIZE = struct.calcsize(CAM_CONFIG_FMT)
 
 
-def pack_cam_config(blindness_mode, eyes, yolo_conf=-1.0, map_request=0):
-    vals = [int(blindness_mode), float(yolo_conf), int(map_request)]
+def pack_cam_config(blindness_mode, eyes, yolo_conf=-1.0):
+    vals = [int(blindness_mode), float(yolo_conf)]
     for e in eyes:
         vals += [e["crop_w"], e["crop_h"], e["frame_w"], e["frame_h"], e["row_stride"],
                  e["intr_model"], 1 if e["intr_valid"] else 0, 0,
@@ -262,15 +261,15 @@ def pack_cam_config(blindness_mode, eyes, yolo_conf=-1.0, map_request=0):
 
 def unpack_cam_config(blob):
     v = struct.unpack(CAM_CONFIG_FMT, blob[:CAM_CONFIG_SIZE])
-    mode, yolo_conf, map_request = v[0], v[1], v[2]
+    mode, yolo_conf = v[0], v[1]
     eyes = []
     for e in range(NUM_EYES):
-        b = 3 + e * 20
+        b = 2 + e * 20
         eyes.append({"crop_w": v[b], "crop_h": v[b + 1], "frame_w": v[b + 2], "frame_h": v[b + 3],
                      "row_stride": v[b + 4], "intr_model": v[b + 5], "intr_valid": bool(v[b + 6]),
                      "focal_x": v[b + 8], "focal_y": v[b + 9], "pp_x": v[b + 10], "pp_y": v[b + 11],
                      "coeffs": list(v[b + 12:b + 20])})
-    return mode, yolo_conf, map_request, eyes
+    return mode, yolo_conf, eyes
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +284,6 @@ class ShmBridge:
         self.configs = [None, None]
         self.blindness_mode = BLINDNESS_MACULAR
         self.yolo_conf = -1.0   # live YOLO confidence from C++; negative = keep --conf
-        self.map_request = 0    # C++ "next map" press counter; act on changes
         self.config_seq = 0
         self._cam_last_seq = [0, 0]
         self._undistort_cache = [None, None]
@@ -351,7 +349,7 @@ class ShmBridge:
         blob, seq = r
         if seq == self.config_seq:
             return False
-        self.blindness_mode, self.yolo_conf, self.map_request, self.configs = unpack_cam_config(blob)
+        self.blindness_mode, self.yolo_conf, self.configs = unpack_cam_config(blob)
         self.config_seq = seq
         return True
 

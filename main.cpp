@@ -23,6 +23,25 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>   // GetAsyncKeyState (ESC to quit)
+#include <cstdio>    // setvbuf
+
+#include "pipeline_types.h"   // gQuitRequested, needed by the handler below
+
+// Console control handler: a launcher (or Ctrl+C in a terminal) asks us to
+// quit; we set the flag and let the render loop fall through to teardown.
+// Returning TRUE tells Windows we handled it (no default termination).
+static BOOL WINAPI onConsoleCtrl(DWORD type)
+{
+    switch (type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+        gQuitRequested.store(true);
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
 
 #include <chrono>
 #include <cmath>    // lround (mask-opacity logging)
@@ -32,7 +51,6 @@
 
 #include "phase_timers.h"
 
-#include "pipeline_types.h"
 #include "transport.h"
 #include "phx_shm.h"
 #include "varjo_source.h"
@@ -50,6 +68,11 @@
 
 int main(int argc, char** argv)
 {
+    // stdout is a pipe when a launcher runs us; without this MSVC fully
+    // buffers it and the "[SHM] ready" line would not arrive for minutes.
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    SetConsoleCtrlHandler(onConsoleCtrl, TRUE);
+
     // OpenGL must be ready before creating Varjo GL swapchains.
     OverlayRenderer renderer;
     if (!renderer.initGL()) return 1;
@@ -77,8 +100,15 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--height"))   reqH = (int)next((float)reqH);
         else if (!strcmp(a, "--stereo"))   windowViews = NUM_EYES;
         else if (!strcmp(a, "--conf"))     gYoloConf.store(next(gYoloConf.load()));
+        else if (!strcmp(a, "--mode")) {
+            const char* v = (i + 1 < argc) ? argv[++i] : "";
+            if      (!strcmp(v, "macular"))  gBlindnessMode.store(BLINDNESS_MACULAR);
+            else if (!strcmp(v, "glaucoma")) gBlindnessMode.store(BLINDNESS_GLAUCOMA);
+            else if (!strcmp(v, "full"))     gBlindnessMode.store(BLINDNESS_FULL);
+            else { fprintf(stderr, "--mode: expected macular|glaucoma|full, got '%s'\n", v); return 2; }
+        }
         else {
-            fprintf(stderr, "usage: %s [--conf T] [--webcam [index|url|file] [--fov DEG] [--width W] [--height H] [--stereo]]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--conf T] [--mode macular|glaucoma|full] [--webcam [index|url|file] [--fov DEG] [--width W] [--height H] [--stereo]]\n", argv[0]);
             return 2;
         }
     }
@@ -186,8 +216,6 @@ int main(int argc, char** argv)
     printf("     Keys , / . lower / raise the YOLO confidence threshold by %.2f per press\n"
            "     (forwarded to Python). A [STATE] line prints on every change.\n",
            kYoloConfStep);
-    printf("     Key N asks Python for the next phosphene map in its --coords list\n"
-           "     (the phosphene layer goes dark for a few seconds while it rebuilds).\n");
 
     // Status line: one printf whenever any user-facing state changes (keys or
     // Python announcing a map), so "what am I looking at" is always the last
@@ -230,7 +258,6 @@ int main(int argc, char** argv)
     };
     EdgeKey keyRadiusDown{ VK_OEM_4 }, keyRadiusUp{ VK_OEM_6 };       // '[' ']'
     EdgeKey keyConfDown{ VK_OEM_COMMA }, keyConfUp{ VK_OEM_PERIOD };  // ',' '.'
-    EdgeKey keyMapNext{ 'N' };
 
     // Reused scratch for consumed phosphene bytes; the render thread is single.
     std::vector<uint8_t> phospheneGray;
@@ -245,7 +272,7 @@ int main(int argc, char** argv)
 
     while (true) {
         // Simple local exit condition for the sample program.
-        if (display->shouldQuit()) break;
+        if (display->shouldQuit() || gQuitRequested.load()) break;
 
         // Alignment aid: dim the mask so the MR passthrough is visible behind
         // the phosphenes. Assigning the same value repeatedly is harmless, so
@@ -287,12 +314,6 @@ int main(int argc, char** argv)
         // header on the next camera frame and Python applies it per dispatch.
         if (keyConfDown.pressed()) stepAtomic(gYoloConf, -kYoloConfStep, kYoloConfMin, kYoloConfMax);
         if (keyConfUp.pressed())   stepAtomic(gYoloConf, +kYoloConfStep, kYoloConfMin, kYoloConfMax);
-
-        // Next phosphene map: Python owns the list; we only count presses.
-        if (keyMapNext.pressed()) {
-            const int32_t n = gMapRequest.fetch_add(1) + 1;
-            printf("[MAP] next map requested (#%d); waiting for Python to rebuild\n", n);
-        }
 
         display->pollEvents();
         display->waitSync();

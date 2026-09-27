@@ -1,0 +1,21 @@
+/* Dark theme for the launcher. Colours are the only thing to edit. */
+QWidget { background: #1e1f24; color: #e6e6e6; font-size: 10pt; }
+QGroupBox { border: 1px solid #34363d; border-radius: 6px; margin-top: 12px; padding: 8px 6px 6px 6px; }
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #9aa3b2; }
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QListWidget {
+    background: #15161a; border: 1px solid #34363d; border-radius: 4px; padding: 3px 6px; }
+QLineEdit[invalid="true"], QComboBox[invalid="true"], QListWidget[invalid="true"] { border: 1px solid #e0554d; }
+QPushButton { background: #2b2d34; border: 1px solid #3d4048; border-radius: 5px; padding: 6px 14px; }
+QPushButton:hover { background: #363941; }
+QPushButton:disabled { color: #6b6f78; }
+QPushButton#start { background: #2f7d4f; border-color: #3a9a62; font-weight: bold; }
+QPushButton#start:hover { background: #369159; }
+QPushButton#stop  { background: #8a3b36; border-color: #a8483f; font-weight: bold; }
+QPushButton#stop:hover  { background: #9e443e; }
+QLabel#status_ok { color: #5ed28a; } QLabel#status_bad { color: #ff7b72; } QLabel#status_wait { color: #f2c14e; }
+QPlainTextEdit { font-family: Consolas, "Courier New", monospace; font-size: 9pt; }
+QListWidget::item { padding: 3px; }
+QListWidget::item:selected { background: #2f4a6b; }
+QTabBar::tab { background: #2b2d34; padding: 6px 12px; border-top-left-radius: 4px; border-top-right-radius: 4px; }
+QTabBar::tab:selected { background: #15161a; }
+QToolButton { border: none; color: #9aa3b2; }

@@ -188,18 +188,17 @@ def test_python_producer_c_consumer():
 
 def test_bridge_config_blob_roundtrip():
     """ShmBridge's cam-config packing must match transport.cpp's CamConfigBlob."""
-    assert phx_shm.CAM_CONFIG_SIZE == 268
+    assert phx_shm.CAM_CONFIG_SIZE == 264
     eye = dict(crop_w=158, crop_h=158, frame_w=1152, frame_h=1152, row_stride=1152,
                intr_model=2, intr_valid=True, focal_x=560.0, focal_y=560.0,
                pp_x=580.0, pp_y=571.0, coeffs=[0.1, 0.2, 0, 0, 0, 0, 0, 0])
-    blob = phx_shm.pack_cam_config(1, [eye, eye], yolo_conf=0.4, map_request=7)
-    mode, conf, map_request, eyes = phx_shm.unpack_cam_config(blob)
+    blob = phx_shm.pack_cam_config(1, [eye, eye], yolo_conf=0.4)
+    mode, conf, eyes = phx_shm.unpack_cam_config(blob)
     assert mode == 1 and eyes[0] == eye and eyes[1] == eye
     assert abs(conf - 0.4) < 1e-6
-    assert map_request == 7
-    # Defaults: -1 conf sentinel (Python keeps its own --conf), no map request.
-    _, conf, map_request, _ = phx_shm.unpack_cam_config(phx_shm.pack_cam_config(0, [eye, eye]))
-    assert conf < 0 and map_request == 0
+    # Default: -1 conf sentinel (Python keeps its own --conf).
+    _, conf, _ = phx_shm.unpack_cam_config(phx_shm.pack_cam_config(0, [eye, eye]))
+    assert conf < 0
 
 
 def test_bridge_wait_camera_uses_last_seen_seq():

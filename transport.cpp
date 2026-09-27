@@ -84,7 +84,6 @@ static void writeConfigIfChanged(PhospheneBridge& bridge, const CameraFrame* fra
     CamConfigBlob next = bridge.lastConfig;
     next.blindnessMode = (int32_t)gBlindnessMode.load(std::memory_order_relaxed);
     next.yoloConf = gYoloConf.load(std::memory_order_relaxed);
-    next.mapRequest = gMapRequest.load(std::memory_order_relaxed);
     fillEyeConfig(bridge, frame, eye, next.eye[eye]);
     if (bridge.configWritten && std::memcmp(&next, &bridge.lastConfig, sizeof(next)) == 0) return;
     if (phx_config_write(bridge.cam, &next, sizeof(next)) != PHX_OK) return;

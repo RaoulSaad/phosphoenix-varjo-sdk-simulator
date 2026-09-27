@@ -37,16 +37,15 @@ struct ShmEyeConfig {
     double  principalPointY;
     double  distortionCoefficients[8];
 };
-// Must match phx_shm.py CAM_CONFIG_FMT ("<ifi" + "8i12d" * 2), 268 bytes.
+// Must match phx_shm.py CAM_CONFIG_FMT ("<if" + "8i12d" * 2), 264 bytes.
 struct CamConfigBlob {
     int32_t       blindnessMode;
     float         yoloConf;       // live YOLO confidence threshold (negative = not set)
-    int32_t       mapRequest;     // "next phosphene map" press counter; Python acts on changes
     ShmEyeConfig  eye[NUM_EYES];
 };
 #pragma pack(pop)
 static_assert(sizeof(ShmEyeConfig) == 128, "ShmEyeConfig must be 128 bytes");
-static_assert(sizeof(CamConfigBlob) == 268, "CamConfigBlob must be 268 bytes");
+static_assert(sizeof(CamConfigBlob) == 264, "CamConfigBlob must be 264 bytes");
 
 struct PhospheneBridge : public IFrameSink {
     std::atomic<bool> running{false};

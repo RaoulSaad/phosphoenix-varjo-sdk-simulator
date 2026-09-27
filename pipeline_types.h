@@ -52,12 +52,10 @@ constexpr float kYoloConfStep    = 0.05f;
 constexpr float kYoloConfMin     = 0.05f;
 constexpr float kYoloConfMax     = 0.95f;
 
-// "Next phosphene map" request counter. Each key press bumps it; the transport
-// mirrors it into the cam header and Python swaps to the next map in its list
-// whenever the value changes (then re-announces the device field, which C++
-// adopts through the usual handshake). A counter rather than a flag so a press
-// can never be lost or double-counted across the config seqlock.
-extern std::atomic<int32_t> gMapRequest;
+// Set by the console control handler (Ctrl+C / Ctrl+Break / window close) so
+// a launcher can stop the app cleanly: the render loop exits and the normal
+// teardown (camera, shared memory shutdown flag, Varjo session) runs.
+extern std::atomic<bool> gQuitRequested;
 
 // Fixed implant's phosphene half-field, as tan(half-FOV). This one constant
 // sets BOTH ends of the loop: computePythonCropSize() asks Python for a camera
