@@ -52,6 +52,11 @@ constexpr float kYoloConfStep    = 0.05f;
 constexpr float kYoloConfMin     = 0.05f;
 constexpr float kYoloConfMax     = 0.95f;
 
+// Keys are the fallback control surface. While a launcher's control section
+// (phx_ctl) is connected, the launcher decides through this flag whether the
+// system-wide keys still act; default true so the terminal workflow is unchanged.
+extern std::atomic<bool> gKeyboardEnabled;
+
 // Set by the console control handler (Ctrl+C / Ctrl+Break / window close) so
 // a launcher can stop the app cleanly: the render loop exits and the normal
 // teardown (camera, shared memory shutdown flag, Varjo session) runs.

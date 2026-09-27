@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 #include "phase_timers.h"
 #include "phx_shm.h"
@@ -15,6 +16,8 @@
 
 static const char* kCamName  = "phx_cam";
 static const char* kPhosName = "phx_phos";
+static const char* kCtlName  = "phx_ctl";
+static const char* kStatName = "phx_stat";
 
 // Fallback camera angular half-extents used only when Varjo intrinsics are not
 // available. These approximate how a tangent-space radius maps to camera pixels.
@@ -110,6 +113,13 @@ bool startPhospheneBridge(PhospheneBridge& bridge, uint32_t camPayloadBytes)
     }
     phx_heartbeat(bridge.cam);
     bridge.running.store(true);
+    {
+        phx_layout statLay{ 1u, 2u, 64u };
+        if (phx_open(kStatName, PHX_PRODUCER, &statLay, &bridge.stat) != PHX_OK) {
+            fprintf(stderr, "[SHM] phx_open(%s) failed; launcher status panel unavailable\n", kStatName);
+            bridge.stat = nullptr;
+        }
+    }
     phx_layout got{}; phx_get_layout(bridge.cam, &got);
     printf("[SHM] ready: %s (%u channels x %u slots x %.1f MB); waiting for Python to create %s\n",
            kCamName, got.channels, got.slots, got.payload_bytes / 1048576.0, kPhosName);
@@ -120,6 +130,8 @@ void stopPhospheneBridge(PhospheneBridge& bridge)
 {
     bridge.running.store(false);
     if (bridge.cam) phx_set_shutdown(bridge.cam);
+    if (bridge.stat) { phx_set_shutdown(bridge.stat); phx_close(bridge.stat); bridge.stat = nullptr; }
+    if (bridge.ctl)  { phx_close(bridge.ctl);  bridge.ctl  = nullptr; }
     if (bridge.phos) { phx_close(bridge.phos); bridge.phos = nullptr; }
     if (bridge.cam)  { phx_close(bridge.cam);  bridge.cam  = nullptr; }
 }
@@ -229,6 +241,8 @@ void bridgeHeartbeat(PhospheneBridge& bridge)
 {
     if (bridge.cam)  phx_heartbeat(bridge.cam);
     if (bridge.phos) phx_heartbeat(bridge.phos);
+    if (bridge.stat) phx_heartbeat(bridge.stat);
+    if (bridge.ctl)  phx_heartbeat(bridge.ctl);
 }
 
 bool pythonAlive(PhospheneBridge& bridge, double maxAgeSeconds)
@@ -238,4 +252,73 @@ bool pythonAlive(PhospheneBridge& bridge, double maxAgeSeconds)
     const uint64_t maxAge = (uint64_t)(maxAgeSeconds * 1e9);
     if (bridge.phos && phx_peer_alive(bridge.phos, maxAge)) return true;
     return bridge.cam && phx_peer_alive(bridge.cam, maxAge) == 1;
+}
+
+// ---------------------------------------------------------------------------
+// Launcher live panel
+// ---------------------------------------------------------------------------
+static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+bool pollControl(PhospheneBridge& bridge, double peerDeadAfterSeconds, float* outOpacity)
+{
+    *outOpacity = std::numeric_limits<float>::quiet_NaN();
+
+    if (!bridge.ctl) {
+        // F-5: after a dead peer is dropped below, don't hammer phx_open every
+        // frame; wait out the retry window so reconnect/disconnect logging
+        // does not flood while the launcher is (still) gone.
+        if (phx_now_ns() < bridge.ctlRetryAfterNs) return false;
+        phx_handle* h = nullptr;
+        if (phx_open(kCtlName, PHX_CONSUMER, nullptr, &h) != PHX_OK) return false;   // no launcher
+        bridge.ctl = h;
+        bridge.ctlSeq = 0;
+        printf("[SHM] launcher connected (%s): keys off until enabled from its panel\n", kCtlName);
+    }
+
+    if (!phx_peer_alive(bridge.ctl, (uint64_t)(peerDeadAfterSeconds * 1e9))) {
+        // Launcher closed or crashed: forget the section so the keys come back.
+        phx_close(bridge.ctl);
+        bridge.ctl = nullptr;
+        bridge.ctlSeq = 0;
+        bridge.ctlRetryAfterNs = phx_now_ns() + 1'000'000'000ull;   // F-5: throttle the reconnect attempts
+        gKeyboardEnabled.store(true);
+        printf("[SHM] launcher disconnected: keys back on\n");
+        return false;
+    }
+
+    CtlBlock c{};
+    uint32_t bytes = 0; uint64_t seq = 0;
+    const int r = phx_config_read(bridge.ctl, &c, sizeof(c), &bytes, &seq);
+    if (r != PHX_OK || bytes < sizeof(c) || seq == bridge.ctlSeq) return true;   // nothing new
+    bridge.ctlSeq = seq;
+
+    if (c.version != kCtlVersion) {
+        if (!bridge.ctlVersionWarned) {
+            fprintf(stderr, "[SHM] control block version %d (expected %d): ignoring the launcher's controls\n",
+                    c.version, kCtlVersion);
+            bridge.ctlVersionWarned = true;
+        }
+        return true;
+    }
+
+    // F-1: the control block carries the mode and the CURRENT mode's radius
+    // slider together, so on a mode switch the slider still holds the OLD
+    // mode's value; capture the mode before switching and only apply the
+    // radius when the block's mode still matches it (the next status block
+    // then moves the slider to the new mode's own radius).
+    const BlindnessMode before = gBlindnessMode.load();
+    if (c.blindnessMode >= 0 && c.blindnessMode < NUM_BLINDNESS_MODES)
+        gBlindnessMode.store((BlindnessMode)c.blindnessMode);
+    if (before != BLINDNESS_FULL && c.blindnessMode == (int32_t)before)
+        gSpotRadiusTan[before].store(clampf(c.spotRadiusTan, kSpotRadiusMinTan, kSpotRadiusMaxTan));
+    gYoloConf.store(clampf(c.yoloConf, kYoloConfMin, kYoloConfMax));
+    gKeyboardEnabled.store(c.keyboardEnabled != 0);
+    *outOpacity = clampf(c.maskOpacity, 0.0f, 1.0f);
+    return true;
+}
+
+void writeStatus(PhospheneBridge& bridge, const StatBlock& s)
+{
+    if (!bridge.stat) return;
+    phx_config_write(bridge.stat, &s, sizeof(s));
 }

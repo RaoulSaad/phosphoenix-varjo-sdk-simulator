@@ -41,7 +41,8 @@ public:
         m_count[phase].fetch_add(1, std::memory_order_relaxed);
     }
 
-    // Render loop, once per second. Skips phases with no samples.
+    // Render loop, once per second. Skips phases with no samples. Also keeps
+    // the averages it printed, for the launcher's status block.
     void printAndReset() {
         static const char* kNames[TIMER_PHASE_COUNT] = {
             "capture", "shm_pub", "shm_con", "render", "e2e"};
@@ -51,6 +52,7 @@ public:
         for (int p = 0; p < TIMER_PHASE_COUNT; ++p) {
             const long long ns = m_ns[p].exchange(0, std::memory_order_relaxed);
             const long long n  = m_count[p].exchange(0, std::memory_order_relaxed);
+            m_lastMs[p] = (n == 0) ? 0.0f : (float)((double)ns / 1e6 / (double)n);
             if (n == 0 || off >= (int)sizeof(line) - 32) continue;
             any = true;
             off += snprintf(line + off, sizeof(line) - off, "  %s=%6.2fms",
@@ -59,9 +61,16 @@ public:
         if (any) printf("%s\n", line);
     }
 
+    // Averages of the last printed second, ms per phase (0 = no samples).
+    // Render thread only (same thread that calls printAndReset).
+    void lastAveragesMs(float out[TIMER_PHASE_COUNT]) const {
+        for (int p = 0; p < TIMER_PHASE_COUNT; ++p) out[p] = m_lastMs[p];
+    }
+
 private:
     std::atomic<long long> m_ns[TIMER_PHASE_COUNT]{};
     std::atomic<long long> m_count[TIMER_PHASE_COUNT]{};
+    float m_lastMs[TIMER_PHASE_COUNT]{};
 };
 
 inline PhaseTimers gPhaseTimers;

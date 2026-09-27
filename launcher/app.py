@@ -1,6 +1,7 @@
 """Launcher window. Thin: maps widgets <-> FormModel and drives ManagedProcess.
 Run: python launcher/app.py   (from the phos-rtcv env; see Launch Simulator.bat)"""
 import html
+import math
 import os
 import sys
 import time
@@ -8,18 +9,24 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QMainWindow, QMessageBox,
-                               QPlainTextEdit, QPushButton, QRadioButton, QSpinBox, QTabWidget,
+                               QPlainTextEdit, QPushButton, QRadioButton, QSlider, QSpinBox, QTabWidget,
                                QToolButton, QVBoxLayout, QWidget)
 
 from launcher import commands, config
+from launcher.livelink import LiveLink
 from launcher.procs import ManagedProcess
 
 READY_TIMEOUT_S = 30.0
 STOP_TIMEOUT_S = 5.0
 LOG_MAX_LINES = 5000
+
+# F-4: mirror C++'s startup values (gSpotRadiusTan in pipeline_types.cpp) so the
+# initial control block sent right after connect carries the CURRENT mode's
+# radius, not a stale slider value.
+DEFAULT_SPOT_RADIUS = {"macular": 0.24, "glaucoma": 0.15, "full": 0.0}
 
 KEY_LEGEND = ("Runtime keys (C++ window need not be focused):\n"
               "  M / G / F   blindness mode        [ / ]   scotoma / tunnel radius\n"
@@ -27,7 +34,9 @@ KEY_LEGEND = ("Runtime keys (C++ window need not be focused):\n"
               "  Esc         quit\n"
               "These keys are system-wide: typing M, G, F, N, a digit or a bracket into\n"
               "this launcher while the simulation runs changes it too, and Esc anywhere\n"
-              "(including this launcher's own dialogs) quits the C++ app.")
+              "(including this launcher's own dialogs) quits the C++ app."
+              "\nWhile this launcher is connected the keys are OFF; tick 'Keyboard control'\n"
+              "in the Live panel to enable them.")
 
 LINE_COLOURS = (("[ERR]", "#ff7b72"), ("Traceback", "#ff7b72"), ("[WARN]", "#f2c14e"),
                 ("[STATE]", "#7cc7ff"), ("[MAP]", "#c792ea"), ("[GEOM]", "#c792ea"),
@@ -84,6 +93,7 @@ class LauncherWindow(QMainWindow):
         outer.addWidget(self.setup_pane, 3)
         right = QVBoxLayout()
         right.addWidget(self._build_control(), 0)
+        right.addWidget(self._build_live(), 0)
         right.addWidget(self._build_logs(), 1)
         outer.addLayout(right, 4)
 
@@ -200,6 +210,118 @@ class LauncherWindow(QMainWindow):
         legend = QLabel(KEY_LEGEND); legend.setStyleSheet("font-family: Consolas, monospace; color: #9aa3b2;")
         v.addWidget(legend)
         return g
+
+    def _build_live(self):
+        self.live = LiveLink()
+        self._live_syncing = False
+        self._live_seeded = False
+        self.live_group = QGroupBox("Live (simulation running)"); v = QVBoxLayout(self.live_group)
+
+        row = QHBoxLayout(); row.addWidget(QLabel("Mode"))
+        self.live_mode = []; self._live_mode_group = QButtonGroup(self)
+        for i, name in enumerate(config.MODES):
+            rb = QRadioButton(name); self._live_mode_group.addButton(rb, i); row.addWidget(rb)
+            rb.toggled.connect(self._on_live_changed); self.live_mode.append(rb)
+        row.addStretch(1)
+        self.live_keyboard = QCheckBox("Keyboard control"); self.live_keyboard.setChecked(False)
+        self.live_keyboard.toggled.connect(self._on_live_changed)
+        row.addWidget(self.live_keyboard)
+        v.addLayout(row)
+
+        def slider(lo, hi, step_label):
+            s = QSlider(Qt.Horizontal); s.setRange(lo, hi); s.setSingleStep(1); s.setPageStep(5)
+            s.valueChanged.connect(self._on_live_changed)
+            lab = QLabel(step_label); lab.setMinimumWidth(150)
+            return s, lab
+        grid = QFormLayout()
+        self.live_spot, self.live_spot_label = slider(0, 60, "")           # value / 100 = tan
+        self.live_opacity, self.live_opacity_label = slider(0, 100, "")    # percent
+        self.live_conf, self.live_conf_label = slider(1, 19, "")           # value * 0.05
+        for s, lab, title in ((self.live_spot, self.live_spot_label, "Scotoma / tunnel radius"),
+                              (self.live_opacity, self.live_opacity_label, "Mask opacity"),
+                              (self.live_conf, self.live_conf_label, "YOLO confidence")):
+            h = QHBoxLayout(); h.addWidget(s, 1); h.addWidget(lab); grid.addRow(title, h)
+        v.addLayout(grid)
+
+        self.live_status1 = QLabel("not connected"); self.live_status2 = QLabel("")
+        for lab in (self.live_status1, self.live_status2):
+            lab.setStyleSheet("font-family: Consolas, monospace; color: #9aa3b2;")
+        v.addWidget(self.live_status1); v.addWidget(self.live_status2)
+
+        self._live_send_timer = QTimer(self); self._live_send_timer.setSingleShot(True)
+        self._live_send_timer.setInterval(50); self._live_send_timer.timeout.connect(self._send_live)
+        self._live_last_send = 0.0
+        self.live_group.setEnabled(False)
+        self._update_live_labels()
+        return self.live_group
+
+    def _live_values(self):
+        idx = self._live_mode_group.checkedId()
+        return (idx if idx >= 0 else 0, self.live_spot.value() / 100.0, self.live_opacity.value() / 100.0,
+                round(self.live_conf.value() * 0.05, 3), self.live_keyboard.isChecked())
+
+    def _update_live_labels(self):
+        _, spot, opacity, conf, _ = self._live_values()
+        self.live_spot_label.setText(f"{spot:.2f} tan ({math.degrees(math.atan(spot)):.1f} deg)")
+        self.live_opacity_label.setText(f"{int(round(opacity * 100))} %")
+        self.live_conf_label.setText(f"{conf:.2f}")
+
+    def _on_live_changed(self, *_):
+        self._update_live_labels()
+        if self._live_syncing:
+            return
+        self._live_send_timer.start()
+
+    def _send_live(self):
+        self.live.set_controls(*self._live_values())
+        self._live_last_send = time.monotonic()
+
+    def _refresh_live(self, info: dict):
+        status = info.get("status")
+        if not info.get("connected") or status is None:
+            self.live_group.setEnabled(False)
+            self.live_status1.setText("not connected" if self.phase == "stopped" else
+                                      "waiting for status from C++ (old build?)")
+            self.live_status2.setText("")
+            return
+        if not info.get("cpp_alive"):
+            # F-3: a dead C++ leaves stale numbers in `status`; don't drive the
+            # group (or claim the labels are live) from them.
+            self.live_group.setEnabled(False)
+            self.live_status1.setText("C++ not responding")
+            self.live_status2.setText("")
+            return
+        self.live_group.setEnabled(True)
+        dragging = any(s.isSliderDown() for s in (self.live_spot, self.live_opacity, self.live_conf))
+        pending_send = (self._live_send_timer.isActive()
+                         or time.monotonic() - self._live_last_send < 0.2)
+        if not dragging and not pending_send:
+            self._live_syncing = True
+            try:
+                self.live_mode[status["mode"]].setChecked(True)
+                self.live_spot.setValue(int(round(status["spot_radius_tan"] * 100)))
+                self.live_opacity.setValue(int(round(status["mask_opacity"] * 100)))
+                self.live_conf.setValue(int(round(status["yolo_conf"] / 0.05)))
+                if self._live_seeded:
+                    self.live_keyboard.setChecked(status["keyboard_enabled"])
+            finally:
+                self._live_syncing = False
+            self._update_live_labels()
+            if not self._live_seeded:
+                # First status: adopt C++'s values, then claim the keys (off by default).
+                self._live_seeded = True
+                self._send_live()
+        p = info.get("pipeline", {})
+        self.live_status1.setText(
+            f"mode={config.MODES[status['mode']]}  spot={status['spot_radius_tan']:.2f}  "
+            f"opacity={int(round(status['mask_opacity'] * 100))}%  conf={status['yolo_conf']:.2f}  "
+            f"field=+/-{math.degrees(math.atan(status['device_field_tan'])):.1f}deg  "
+            f"python={'alive' if status['python_alive'] else 'DOWN'}  keys={'on' if status['keyboard_enabled'] else 'off'}")
+        self.live_status2.setText(
+            f"C++ {status['render_fps']:.0f} fps  capture={status['capture_ms']:.2f}  shm_pub={status['shm_pub_ms']:.2f}  "
+            f"shm_con={status['shm_con_ms']:.2f}  render={status['render_ms']:.2f}  e2e={status['e2e_ms']:.1f}ms  |  "
+            f"pipeline L={p.get('fps_left', 0):.0f} R={p.get('fps_right', 0):.0f} fps  "
+            f"pipeline={p.get('pipeline_ms', 0):.1f}ms")
 
     def _build_logs(self):
         self.tabs = QTabWidget()
@@ -383,12 +505,24 @@ class LauncherWindow(QMainWindow):
         self._run_model = self.model    # frozen for this run; _launch_pipeline reads only this
         self._killed = False
         self.cpp_log.clear(); self.py_log.clear()
+        self._live_seeded = False
+        if self.live.start():
+            # F-4: claim keys-off on C++'s very first poll, before any status
+            # comes back; do not mark this as the seed (that still happens
+            # from the first real status) and do not stamp _live_last_send
+            # (that grace period would block the seed sync at 200 ms).
+            self.live.set_controls(config.MODES.index(self._run_model.mode),
+                                   DEFAULT_SPOT_RADIUS[self._run_model.mode], 1.0,
+                                   self._run_model.conf, False)
+        else:
+            self.cpp_log.add(f"[launcher] live panel unavailable: {self.live.error}")
         self.cpp = ManagedProcess("cpp", commands.build_cpp_command(self._run_model), cwd=self._run_model.repo_root,
                                   ready_marker=commands.READY_LINE)
         self.py = None
         try:
             self.cpp.start()
         except OSError as e:
+            self.live.stop()
             self._set_status(self.cpp_status, f"C++ app: failed to start ({e})", "bad"); return
         self._set_phase("starting"); self._deadline = time.time() + READY_TIMEOUT_S
         self._set_status(self.cpp_status, "C++ app: starting", "wait")
@@ -418,6 +552,8 @@ class LauncherWindow(QMainWindow):
             if proc:
                 for line in proc.poll_lines():
                     pane.add(line)
+                    if proc is self.py:
+                        self.live.feed_pipeline_line(line)
         if self.phase == "starting":
             if self.cpp.ready:
                 self._set_status(self.cpp_status, "C++ app: running", "ok")
@@ -447,6 +583,8 @@ class LauncherWindow(QMainWindow):
                     p.kill(wait=False)
                     self.cpp_log.add(f"[launcher] {p.name} did not exit in time; killing")
                 self._killed = True
+        if self.phase in ("starting", "running", "stopping"):
+            self._refresh_live(self.live.poll())
         self._maybe_quit_when_done()
 
     @staticmethod
@@ -486,6 +624,9 @@ class LauncherWindow(QMainWindow):
         so the running command can't be edited out from under a live process."""
         self.phase = phase
         self.setup_pane.setEnabled(phase == "stopped")
+        if phase == "stopped":
+            self.live.stop()
+            self._refresh_live({"connected": False, "status": None})
 
     def closeEvent(self, event):
         if self.phase == "stopped":

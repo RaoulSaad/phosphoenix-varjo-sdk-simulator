@@ -23,6 +23,7 @@ std::atomic<float> gSpotRadiusTan[NUM_BLINDNESS_MODES] = {
 };
 
 std::atomic<float> gYoloConf{kYoloConfDefault};
+std::atomic<bool> gKeyboardEnabled{true};
 std::atomic<bool> gQuitRequested{false};
 
 const char* blindnessModeName(BlindnessMode mode)

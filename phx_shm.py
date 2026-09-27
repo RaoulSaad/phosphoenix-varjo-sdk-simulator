@@ -273,6 +273,124 @@ def unpack_cam_config(blob):
 
 
 # ---------------------------------------------------------------------------
+# Launcher live panel: control block (launcher -> C++) and status block
+# (C++ -> launcher), one packed struct per section config block.
+# Must match transport.h CtlBlock / StatBlock.
+# ---------------------------------------------------------------------------
+CTL_NAME, STAT_NAME = "phx_ctl", "phx_stat"
+CTL_VERSION, STAT_VERSION = 1, 1
+# version, mode, spot_radius_tan, mask_opacity, yolo_conf, keyboard_enabled, habituation, recording
+CTL_FMT = "<iifffiii"
+STAT_FIELDS = ("version", "mode", "spot_radius_tan", "mask_opacity", "yolo_conf", "device_field_tan",
+               "python_alive", "keyboard_enabled", "render_fps", "capture_ms", "shm_pub_ms",
+               "shm_con_ms", "render_ms", "e2e_ms")
+STAT_FMT = "<iiffffiiffffff"
+CTL_SIZE, STAT_SIZE = struct.calcsize(CTL_FMT), struct.calcsize(STAT_FMT)
+assert len(STAT_FIELDS) == 14 and STAT_SIZE == 56 and CTL_SIZE == 32
+
+
+def pack_ctl(mode, spot_radius_tan, mask_opacity, yolo_conf, keyboard_enabled):
+    return struct.pack(CTL_FMT, CTL_VERSION, int(mode), float(spot_radius_tan), float(mask_opacity),
+                       float(yolo_conf), 1 if keyboard_enabled else 0, 0, 0)
+
+
+def unpack_ctl(blob):
+    v = struct.unpack(CTL_FMT, blob[:CTL_SIZE])
+    return {"version": v[0], "mode": v[1], "spot_radius_tan": v[2], "mask_opacity": v[3],
+            "yolo_conf": v[4], "keyboard_enabled": bool(v[5]), "habituation": v[6], "recording": v[7]}
+
+
+def pack_stat(**fields):
+    """Test helper / fake C++ side. Missing fields are 0; version defaults."""
+    fields.setdefault("version", STAT_VERSION)
+    return struct.pack(STAT_FMT, *[fields.get(k, 0) for k in STAT_FIELDS])
+
+
+def unpack_stat(blob):
+    s = dict(zip(STAT_FIELDS, struct.unpack(STAT_FMT, blob[:STAT_SIZE])))
+    s["python_alive"] = bool(s["python_alive"])
+    s["keyboard_enabled"] = bool(s["keyboard_enabled"])
+    return s
+
+
+class ControlLink:
+    """The launcher's end of the live panel: producer of phx_ctl, consumer of
+    phx_stat. C++ opens phx_ctl lazily and creates phx_stat at startup."""
+
+    def __init__(self):
+        self.ctl = None
+        self.stat = None
+        self._last_blob = None
+        self._stat_seq = 0
+        self._version_warned = False   # F-7: print the status-version mismatch once
+
+    def create(self):
+        try:
+            self.ctl = Section.create(CTL_NAME, channels=1, slots=2, payload_bytes=64)
+        except PhxError:
+            unlink(CTL_NAME)                      # stale name from a crashed launcher (POSIX)
+            self.ctl = Section.create(CTL_NAME, channels=1, slots=2, payload_bytes=64)
+        self.ctl.heartbeat()                      # so C++ sees a live peer on its first poll
+        return self
+
+    def send(self, mode, spot_radius_tan, mask_opacity, yolo_conf, keyboard_enabled):
+        """Write the control block; returns False when it equals the last one sent."""
+        blob = pack_ctl(mode, spot_radius_tan, mask_opacity, yolo_conf, keyboard_enabled)
+        if blob == self._last_blob or self.ctl is None:
+            return False
+        self.ctl.config_write(blob)
+        self._last_blob = blob
+        return True
+
+    def heartbeat(self):
+        if self.ctl:
+            self.ctl.heartbeat()
+        if self.stat:
+            self.stat.heartbeat()
+
+    def open_status(self, timeout=0.0):
+        if self.stat is not None:
+            return True
+        try:
+            self.stat = Section.open(STAT_NAME, timeout=timeout)
+        except NotReady:
+            return False
+        self._stat_seq = 0
+        return True
+
+    def read_status(self):
+        """Newest status block, or None when nothing new / not connected / wrong version."""
+        if self.stat is None:
+            return None
+        r = self.stat.config_read()
+        if r is None:
+            return None
+        blob, seq = r
+        if seq == self._stat_seq or len(blob) < STAT_SIZE:
+            return None
+        self._stat_seq = seq
+        s = unpack_stat(blob)
+        if s["version"] != STAT_VERSION:
+            if not self._version_warned:
+                self._version_warned = True
+                print(f"[SHM] status block version {s['version']} (expected {STAT_VERSION}): ignoring")
+            return None
+        return s
+
+    def cpp_alive(self, max_age_s=2.0):
+        return self.stat is not None and bool(self.stat.peer_alive(int(max_age_s * 1e9)))
+
+    def close(self):
+        if self.stat:
+            self.stat.close()
+        if self.ctl:
+            self.ctl.close()
+        self.stat = self.ctl = None
+        self._last_blob = None
+        unlink(CTL_NAME)
+
+
+# ---------------------------------------------------------------------------
 # ShmBridge: what run_varjo.py talks to
 # ---------------------------------------------------------------------------
 class ShmBridge:

@@ -223,3 +223,46 @@ def test_bridge_wait_camera_uses_last_seen_seq():
     b.cam.close()
     prod.set_shutdown()
     prod.close()
+
+
+def test_ctl_and_stat_blocks_round_trip():
+    assert phx_shm.CTL_SIZE == 32 and phx_shm.STAT_SIZE == 56
+    c = phx_shm.unpack_ctl(phx_shm.pack_ctl(1, 0.15, 0.7, 0.4, True))
+    assert c["version"] == phx_shm.CTL_VERSION and c["mode"] == 1 and c["keyboard_enabled"] is True
+    assert c["spot_radius_tan"] == pytest.approx(0.15) and c["mask_opacity"] == pytest.approx(0.7)
+    assert c["yolo_conf"] == pytest.approx(0.4) and c["habituation"] == 0 and c["recording"] == 0
+    s = phx_shm.unpack_stat(phx_shm.pack_stat(mode=2, spot_radius_tan=0.24, python_alive=1,
+                                              keyboard_enabled=0, render_fps=89.5, e2e_ms=31.25))
+    assert s["version"] == phx_shm.STAT_VERSION and s["mode"] == 2
+    assert s["python_alive"] is True and s["keyboard_enabled"] is False
+    assert s["render_fps"] == pytest.approx(89.5) and s["e2e_ms"] == pytest.approx(31.25)
+    assert s["capture_ms"] == 0.0
+
+
+def test_control_link_round_trip():
+    """Launcher side (ControlLink) against a fake C++ side: a Python consumer of
+    phx_ctl and producer of phx_stat, exactly the roles transport.cpp takes."""
+    phx_shm.unlink(phx_shm.CTL_NAME); phx_shm.unlink(phx_shm.STAT_NAME)
+    link = phx_shm.ControlLink().create()
+    try:
+        cpp_ctl = phx_shm.Section.open(phx_shm.CTL_NAME, timeout=1.0)
+        assert cpp_ctl.peer_alive(int(2e9))                     # create() heartbeats at once
+        assert link.send(0, 0.24, 1.0, 0.25, False) is True
+        assert link.send(0, 0.24, 1.0, 0.25, False) is False    # unchanged -> no write
+        blob, seq = cpp_ctl.config_read()
+        c = phx_shm.unpack_ctl(blob)
+        assert c["yolo_conf"] == pytest.approx(0.25) and c["keyboard_enabled"] is False and seq >= 1
+
+        assert link.open_status(timeout=0.0) is False           # C++ has not created phx_stat yet
+        cpp_stat = phx_shm.Section.create(phx_shm.STAT_NAME, channels=1, slots=2, payload_bytes=64)
+        assert link.open_status(timeout=1.0) is True
+        assert link.read_status() is None                       # nothing written yet
+        cpp_stat.config_write(phx_shm.pack_stat(mode=1, spot_radius_tan=0.15, render_fps=90.0))
+        s = link.read_status()
+        assert s is not None and s["mode"] == 1 and s["render_fps"] == pytest.approx(90.0)
+        assert link.read_status() is None                       # same seq -> nothing new
+        cpp_stat.heartbeat()
+        assert link.cpp_alive() is True
+        cpp_ctl.close(); cpp_stat.close()
+    finally:
+        link.close()

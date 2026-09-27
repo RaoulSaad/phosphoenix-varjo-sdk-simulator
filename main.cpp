@@ -216,21 +216,24 @@ int main(int argc, char** argv)
     printf("     Keys , / . lower / raise the YOLO confidence threshold by %.2f per press\n"
            "     (forwarded to Python). A [STATE] line prints on every change.\n",
            kYoloConfStep);
+    printf("     While the launcher is connected these keys are off unless its\n"
+           "     'Keyboard control' box is ticked (Esc still quits).\n");
 
     // Status line: one printf whenever any user-facing state changes (keys or
     // Python announcing a map), so "what am I looking at" is always the last
     // [STATE] line in the console.
     struct StateSnapshot {
         BlindnessMode mode; float spotRadiusTan; float maskOpacity; float deviceFieldTan; float yoloConf;
+        bool keyboardEnabled;   // F-6: what we are actually doing (in StateSnapshot so a toggle doesn't force an extra status write)
         bool operator!=(const StateSnapshot& o) const {
             return mode != o.mode || spotRadiusTan != o.spotRadiusTan ||
                    maskOpacity != o.maskOpacity || deviceFieldTan != o.deviceFieldTan ||
-                   yoloConf != o.yoloConf;
+                   yoloConf != o.yoloConf || keyboardEnabled != o.keyboardEnabled;
         }
     };
-    StateSnapshot lastPrinted{ (BlindnessMode)-1, -1.0f, -1.0f, -1.0f, -1.0f };   // forces the first print
+    StateSnapshot lastPrinted{ (BlindnessMode)-1, -1.0f, -1.0f, -1.0f, -1.0f, false };   // forces the first print
     auto printStateIfChanged = [&](const StateSnapshot& s) {
-        if (!(s != lastPrinted)) return;
+        if (!(s != lastPrinted)) return false;
         lastPrinted = s;
         const double rad2deg = 180.0 / 3.14159265358979;
         printf("[STATE] mode=%s spot=%.2f tan (%.1f deg) opacity=%d%% field=%.4f tan (+/-%.1f deg) conf=%.2f\n",
@@ -239,6 +242,7 @@ int main(int argc, char** argv)
                (int)lround(s.maskOpacity * 100.0f),
                s.deviceFieldTan, std::atan(s.deviceFieldTan) * rad2deg,
                s.yoloConf);
+        return true;
     };
 
     // One press = one step, for keys that accumulate (a held key would
@@ -263,6 +267,10 @@ int main(int argc, char** argv)
     std::vector<uint8_t> phospheneGray;
 
     auto lastTimerPrint = std::chrono::steady_clock::now();
+    auto lastStatusWrite = lastTimerPrint;
+    int  renderFrames = 0;          // frames since the last [TIME] print, for renderFps
+    float lastRenderFps = 0.0f;
+    bool  launcherConnected = false;
 
     // Liveness: Python heartbeats the sections it uses; if it stops for longer
     // than this the phosphene layer is faded out rather than freezing on the
@@ -274,6 +282,16 @@ int main(int argc, char** argv)
         // Simple local exit condition for the sample program.
         if (display->shouldQuit() || gQuitRequested.load()) break;
 
+        // Launcher live panel: apply its control block (if any) before the keys,
+        // and decide whether the keys act at all this frame.
+        {
+            float ctlOpacity;
+            launcherConnected = pollControl(phospheneBridge, kPythonDeadAfterSeconds, &ctlOpacity);
+            if (!std::isnan(ctlOpacity)) renderer.setMaskOpacity(ctlOpacity);
+        }
+        const bool keysActive = !launcherConnected || gKeyboardEnabled.load();
+
+        if (keysActive) {
         // Alignment aid: dim the mask so the MR passthrough is visible behind
         // the phosphenes. Assigning the same value repeatedly is harmless, so
         // no key-edge detection is needed.
@@ -314,6 +332,7 @@ int main(int argc, char** argv)
         // header on the next camera frame and Python applies it per dispatch.
         if (keyConfDown.pressed()) stepAtomic(gYoloConf, -kYoloConfStep, kYoloConfMin, kYoloConfMax);
         if (keyConfUp.pressed())   stepAtomic(gYoloConf, +kYoloConfStep, kYoloConfMin, kYoloConfMax);
+        }
 
         display->pollEvents();
         display->waitSync();
@@ -339,9 +358,33 @@ int main(int argc, char** argv)
         // Load once per frame so the geometry and the shader uniform agree.
         const BlindnessMode   mode = gBlindnessMode.load();
         const OverlayGeometry geom = overlayGeometryFor(mode);
-        printStateIfChanged(StateSnapshot{ mode, geom.spotRadiusTan,
-                                           renderer.maskOpacity(), geom.phospheneRadiusTan,
-                                           gYoloConf.load() });
+        const StateSnapshot   snap{ mode, geom.spotRadiusTan, renderer.maskOpacity(), geom.phospheneRadiusTan,
+                                     gYoloConf.load(), !launcherConnected || gKeyboardEnabled.load() };
+        const bool stateChanged = printStateIfChanged(snap);
+
+        // Status block for the launcher: on every state change and at least
+        // every 100 ms (the launcher ticks at 10 Hz).
+        {
+            const auto tStat = std::chrono::steady_clock::now();
+            if (stateChanged || tStat - lastStatusWrite >= std::chrono::milliseconds(100)) {
+                float ms[TIMER_PHASE_COUNT];
+                gPhaseTimers.lastAveragesMs(ms);
+                StatBlock s{};
+                s.version         = kStatVersion;
+                s.blindnessMode   = (int32_t)mode;
+                s.spotRadiusTan   = geom.spotRadiusTan;
+                s.maskOpacity     = renderer.maskOpacity();
+                s.yoloConf        = gYoloConf.load();
+                s.deviceFieldTan  = geom.phospheneRadiusTan;
+                s.pythonAlive     = pythonWasAlive ? 1 : 0;
+                s.keyboardEnabled = snap.keyboardEnabled ? 1 : 0;   // F-6: from StateSnapshot, no duplicated expression
+                s.renderFps       = lastRenderFps;
+                s.captureMs = ms[TIMER_CAPTURE]; s.shmPubMs = ms[TIMER_SHM_PUB];
+                s.shmConMs  = ms[TIMER_SHM_CON]; s.renderMs = ms[TIMER_RENDER]; s.e2eMs = ms[TIMER_E2E];
+                writeStatus(phospheneBridge, s);
+                lastStatusWrite = tStat;
+            }
+        }
 
     #ifdef PHX_HAVE_WEBCAM
         if (webcam && window) {
@@ -413,8 +456,12 @@ int main(int argc, char** argv)
         gPhaseTimers.add(TIMER_RENDER, renderNs);
 
         // Averaged phase latencies, once per second (mirrors Python's [TIME]).
+        ++renderFrames;
         const auto tNow = std::chrono::steady_clock::now();
         if (tNow - lastTimerPrint >= std::chrono::seconds(1)) {
+            const double sec = std::chrono::duration<double>(tNow - lastTimerPrint).count();
+            lastRenderFps = (float)(renderFrames / sec);
+            renderFrames = 0;
             gPhaseTimers.printAndReset();
             lastTimerPrint = tNow;
         }
